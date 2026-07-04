@@ -445,12 +445,34 @@
     }
 
     .rr-block-workspace {
-        min-height: auto;
+        min-height: 180px;
+        max-height: min(42vh, 280px);
+        overflow: hidden;
     }
 
     .rr-block-head {
-        align-items: flex-start;
+        align-items: stretch;
         flex-direction: column;
+    }
+
+    .rr-block-head > span {
+        flex: 0 0 auto;
+    }
+
+    .rr-block-head .rr-refresh-buttons {
+        width: 100%;
+        min-width: 0;
+        white-space: normal;
+    }
+
+    .rr-block-head .rr-refresh-buttons span {
+        white-space: normal;
+    }
+
+    .rr-block-list {
+        flex: 1 1 auto;
+        min-height: 96px;
+        max-height: none;
     }
 
     .rr-modal-actions {

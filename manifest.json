@@ -7,8 +7,8 @@
     "js": "index.js",
     "css": "style.css",
     "author": "Codex",
-    "version": "0.1.10",
-    "homepage": "https://github.com/local/reply-rescue",
+    "version": "0.1.11",
+    "homepage": "https://github.com/huangsir1111/reply-rescue",
     "hooks": {
         "activate": "init"
     }
