@@ -1,0 +1,15 @@
+{
+    "display_name": "回复救急插件",
+    "description": "对已经生成的助手回复做选中正文片段重写，并可从底部魔法棒菜单打开 UI 自动识别结构块后按需修改；必须预览后才能应用。",
+    "loading_order": 30,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Codex",
+    "version": "0.1.10",
+    "homepage": "https://github.com/local/reply-rescue",
+    "hooks": {
+        "activate": "init"
+    }
+}
