@@ -23,9 +23,12 @@ import { textgenerationwebui_preset_names, textgenerationwebui_presets, textgene
 
 const MODULE_NAME = 'reply_rescue';
 const DISPLAY_NAME = '回复救急插件';
-const SETTINGS_VERSION = '0.1.10';
+const SETTINGS_VERSION = '0.1.12';
 const MAX_UNDO_RECORDS = 10;
 const WORLD_INFO_METADATA_KEY = 'world_info';
+const MULTI_BLOCK_MARKER_PREFIX = 'RR_SELECTED_BLOCK';
+const CONTEXT_LENGTH_MAX = 100000;
+const RESPONSE_LENGTH_MAX = 20000;
 
 const modeLabels = {
     rewrite_selection: '重写选中片段',
@@ -34,7 +37,7 @@ const modeLabels = {
 
 const modeDescriptions = {
     rewrite_selection: '只替换你选中的正文片段，适合改一句话、一段描写或语气。',
-    repair_block: '自动识别这条回复里正文之外的块，点中哪个就只修改哪个。',
+    repair_block: '自动识别这条回复里正文之外的块，可点选一个或多个后一次修复。',
 };
 
 const blockProfiles = {
@@ -100,6 +103,7 @@ const runtime = {
     undoStack: [],
     recognizedBlocks: [],
     selectedBlockIndex: -1,
+    selectedBlockIndexes: new Set(),
 };
 
 function cloneDefaultValue(value) {
@@ -135,9 +139,9 @@ function getSettings() {
         }
     }
 
-    settings.contextLength = clampInteger(settings.contextLength, defaultSettings.contextLength, 300, 6000);
+    settings.contextLength = clampInteger(settings.contextLength, defaultSettings.contextLength, 300, CONTEXT_LENGTH_MAX);
     settings.recentMessages = clampInteger(settings.recentMessages, defaultSettings.recentMessages, 2, 20);
-    settings.responseLength = clampInteger(settings.responseLength, defaultSettings.responseLength, 80, 4000);
+    settings.responseLength = clampInteger(settings.responseLength, defaultSettings.responseLength, 80, RESPONSE_LENGTH_MAX);
     settings.statusStart = String(settings.statusStart || defaultSettings.statusStart);
     settings.statusEnd = String(settings.statusEnd || defaultSettings.statusEnd);
     settings.statusTemplate = String(settings.statusTemplate || '');
@@ -914,6 +918,49 @@ function findManualEvidenceTarget(currentText, sourceText) {
     }
 
     return null;
+}
+
+function makeMultiBlockStartMarker(ordinal) {
+    return `<<<${MULTI_BLOCK_MARKER_PREFIX}_${ordinal}_START>>>`;
+}
+
+function makeMultiBlockEndMarker(ordinal) {
+    return `<<<${MULTI_BLOCK_MARKER_PREFIX}_${ordinal}_END>>>`;
+}
+
+function ensureSelectedBlockIndexSet() {
+    if (!(runtime.selectedBlockIndexes instanceof Set)) {
+        runtime.selectedBlockIndexes = new Set();
+    }
+
+    return runtime.selectedBlockIndexes;
+}
+
+function resetRecognizedBlockSelection() {
+    runtime.selectedBlockIndex = -1;
+    runtime.selectedBlockIndexes = new Set();
+}
+
+function getSelectedBlockIndexes() {
+    const selected = ensureSelectedBlockIndexSet();
+    return [...selected]
+        .filter(index => Number.isInteger(index) && Boolean(runtime.recognizedBlocks[index]))
+        .sort((a, b) => a - b);
+}
+
+function getSelectedRecognizedBlocks() {
+    return getSelectedBlockIndexes()
+        .map(index => runtime.recognizedBlocks[index] ? { ...runtime.recognizedBlocks[index], selectedIndex: index } : null)
+        .filter(Boolean)
+        .sort((a, b) => a.start - b.start || a.end - b.end);
+}
+
+function getRecognizedBlockSelectionKey(block) {
+    if (!block) {
+        return '';
+    }
+
+    return `${block.start}:${block.end}:${block.text}`;
 }
 
 function selectedLooksLikeStatusBlock(selectedText, settings = getSettings()) {
@@ -1957,6 +2004,26 @@ function chooseBlockMarkerPair(blockKind, targetBlock, templateText, settings = 
     return pairs[0] || null;
 }
 
+function resolveCurrentBlockRange(currentText, target, label = '结构块') {
+    const text = String(target?.text || '');
+    const start = Number(target?.start);
+    const end = Number(target?.end);
+    if (!text) {
+        throw new Error(`${label}目标为空，不能安全替换。`);
+    }
+
+    if (Number.isInteger(start) && Number.isInteger(end) && currentText.slice(start, end) === text) {
+        return { start, end };
+    }
+
+    const indexes = findAllIndexes(currentText, text);
+    if (indexes.length === 1) {
+        return { start: indexes[0], end: indexes[0] + text.length };
+    }
+
+    throw new Error(`${label}目标片段已经变化或出现重复，不能安全替换。请重新扫描当前聊天块。`);
+}
+
 function prepareBlockEvidence(active, instruction, sourceText) {
     const settings = getSettings();
     const currentText = getMessageText(active.messageId);
@@ -1973,8 +2040,19 @@ function prepareBlockEvidence(active, instruction, sourceText) {
     let targetBlock = '';
     let applyTarget = '';
     let applyMode = '';
+    let applyStart = -1;
+    let applyEnd = -1;
+    const selectedRecognizedBlocks = getSelectedRecognizedBlocks();
+    const selectedRecognizedBlock = selectedRecognizedBlocks.length === 1 ? selectedRecognizedBlocks[0] : null;
 
-    if (selectedInCurrent) {
+    if (selectedRecognizedBlock) {
+        const range = resolveCurrentBlockRange(currentText, selectedRecognizedBlock, selectedRecognizedBlock.label || '结构块');
+        targetBlock = manualEvidence || selectedRecognizedBlock.text;
+        applyTarget = selectedRecognizedBlock.text;
+        applyMode = 'replace_recognized';
+        applyStart = range.start;
+        applyEnd = range.end;
+    } else if (selectedInCurrent) {
         targetBlock = manualEvidence || selectedText;
         applyTarget = selectedText;
         applyMode = 'replace_selection';
@@ -2005,12 +2083,69 @@ function prepareBlockEvidence(active, instruction, sourceText) {
         targetBlock,
         applyTarget,
         applyMode,
+        applyStart,
+        applyEnd,
         previousExamples,
         template,
         instruction,
         blockKind: inferredKind,
         selectedBlockKind,
         markerPair,
+    };
+}
+
+function prepareMultiBlockEvidence(active, instruction) {
+    const settings = getSettings();
+    const currentText = getMessageText(active.messageId);
+    const template = getCurrentTemplateEvidenceText();
+    const selectedBlocks = getSelectedRecognizedBlocks();
+
+    if (!selectedBlocks.length) {
+        throw new Error('请先在已识别块列表里选择至少一个要修的块。');
+    }
+
+    const targets = selectedBlocks.map((block, index) => {
+        const blockKind = isKnownBlockKind(block.blockKind) && block.blockKind !== 'auto'
+            ? block.blockKind
+            : inferBlockKindFromText([block.label, block.text, template].join('\n'));
+        const range = resolveCurrentBlockRange(currentText, block, block.label || getBlockTypeLabel(blockKind));
+        const ordinal = index + 1;
+
+        return {
+            ordinal,
+            selectedIndex: block.selectedIndex,
+            label: block.label || getBlockTypeLabel(blockKind),
+            source: block.source || '结构块',
+            text: block.text,
+            start: range.start,
+            end: range.end,
+            blockKind,
+            markerPair: chooseBlockMarkerPair(blockKind, block.text, template, settings),
+            startMarker: makeMultiBlockStartMarker(ordinal),
+            endMarker: makeMultiBlockEndMarker(ordinal),
+        };
+    });
+
+    const previousExamples = [];
+    const seenExamples = new Set();
+    for (const blockKind of [...new Set(targets.map(target => target.blockKind))]) {
+        for (const example of findPreviousBlockExamples(active.messageId, blockKind, settings, template, 2)) {
+            const key = example.trim();
+            if (key && !seenExamples.has(key)) {
+                seenExamples.add(key);
+                previousExamples.push(example);
+            }
+        }
+    }
+
+    return {
+        applyMode: 'replace_multiple_blocks',
+        targets,
+        previousExamples,
+        template,
+        instruction,
+        blockKind: 'auto',
+        selectedBlockKind: 'auto',
     };
 }
 
@@ -2028,6 +2163,22 @@ function removeKnownBlock(text, evidence) {
     }
 
     return text;
+}
+
+function removeKnownBlocks(text, evidence) {
+    let result = String(text || '');
+    const targets = [...(evidence?.targets || [])].sort((a, b) => b.start - a.start);
+
+    for (const target of targets) {
+        const placeholder = `[第${target.ordinal}个${target.label}位置]`;
+        if (result.slice(target.start, target.end) === target.text) {
+            result = `${result.slice(0, target.start)}${placeholder}${result.slice(target.end)}`;
+        } else if (target.text && result.includes(target.text)) {
+            result = result.replace(target.text, placeholder);
+        }
+    }
+
+    return result;
 }
 
 function getBlockSpecificRules(blockKind) {
@@ -2094,6 +2245,10 @@ function buildStatusPrompt(active, instruction, sourceText) {
 }
 
 function buildBlockPrompt(active, instruction, sourceText) {
+    if (getSelectedBlockIndexes().length > 1) {
+        return buildMultiBlockPrompt(active, instruction);
+    }
+
     const settings = getSettings();
     const evidence = prepareBlockEvidence(active, instruction, sourceText);
     const contextText = removeKnownBlock(getMessageText(active.messageId), evidence);
@@ -2129,6 +2284,64 @@ function buildBlockPrompt(active, instruction, sourceText) {
         buildRecentContext(active.messageId, settings),
         '',
         '当前回复正文参考：',
+        trimText(contextText, settings.contextLength, true),
+    ].join('\n');
+}
+
+function buildMultiBlockPrompt(active, instruction) {
+    const settings = getSettings();
+    const evidence = prepareMultiBlockEvidence(active, instruction);
+    const contextText = removeKnownBlocks(getMessageText(active.messageId), evidence);
+    const blockList = evidence.targets
+        .map(target => [
+            `第 ${target.ordinal} 个块：${target.label}`,
+            `来源：${target.source}`,
+            `块类型：${getBlockTypeLabel(target.blockKind)}`,
+            `输出开始标记：${target.startMarker}`,
+            `输出结束标记：${target.endMarker}`,
+            '旧结构块或坏掉的结构块证据：',
+            target.text,
+        ].join('\n'))
+        .join('\n\n---\n\n');
+    const markerList = evidence.targets
+        .map(target => `${target.startMarker}\n第 ${target.ordinal} 个修复后的结构块本体\n${target.endMarker}`)
+        .join('\n\n');
+    const specificRules = evidence.targets
+        .flatMap(target => getBlockSpecificRules(target.blockKind).map(rule => `${target.label}：${rule}`));
+
+    runtime.active.blockEvidence = evidence;
+
+    return [
+        `你正在一次修复 ${evidence.targets.length} 个结构块。`,
+        '硬性规则：',
+        `1. 必须输出 ${evidence.targets.length} 个修复后的结构块，每个结构块都要放在指定的输出开始/结束标记之间。`,
+        '2. 每个输出标记之间只能放对应结构块本体，不要解释，不要标题，不要代码围栏，不要合并多个块。',
+        '3. “预设/正则/世界书格式证据”只用于确认外层标签、HTML/class、字段顺序、按钮宏和排版格式，不能当成当前剧情事实。',
+        '4. “旧结构块/当前回复/最近上下文”才是字段值和状态变化的事实依据。',
+        '5. 不要新增模板中不存在的字段，不要改变字段顺序。',
+        '6. 无法从证据确定的字段，保持旧值；如果没有旧值，写“未知”或“无”。',
+        '7. 不要编造地点、时间、人物状态、数值、装备、关系变化、身体变化或剧情进展。',
+        '8. 模板里的 {{divlist}}、{{button}} 等宏必须按原样输出，不要解释成文字。',
+        ...specificRules.map((rule, index) => `${index + 9}. ${rule}`),
+        '',
+        `用户额外要求：${instruction || '无'}`,
+        '',
+        '输出格式必须严格类似：',
+        markerList,
+        '',
+        '预设/正则/世界书格式证据（只当格式，不当事实）：',
+        evidence.template || '无',
+        '',
+        '历史正常结构块样例（优先当格式参考，不能凭空复制旧数值）：',
+        evidence.previousExamples.length ? evidence.previousExamples.join('\n\n---\n\n') : '无',
+        '',
+        '本次要分别修复的旧结构块：',
+        blockList,
+        '',
+        '最近上下文：',
+        buildRecentContext(active.messageId, settings),
+        '',
+        '当前回复正文参考（已用占位符隐藏被修复块）：',
         trimText(contextText, settings.contextLength, true),
     ].join('\n');
 }
@@ -2226,6 +2439,49 @@ function normalizeBlockOutput(output, evidence) {
     throw new Error(`模型返回的${getBlockTypeLabel(evidence?.blockKind)}标记不完整，已拒绝应用。`);
 }
 
+function parseMultiBlockPreview(output, evidence) {
+    const value = stripWrappingCodeFence(output);
+    const targets = evidence?.targets || [];
+    if (!targets.length) {
+        throw new Error('没有可解析的多选结构块目标。');
+    }
+
+    const replacements = targets.map((target) => {
+        const startIndex = value.indexOf(target.startMarker);
+        if (startIndex === -1) {
+            throw new Error(`模型没有返回第 ${target.ordinal} 个块的开始标记，已拒绝应用。`);
+        }
+
+        const contentStart = startIndex + target.startMarker.length;
+        const endIndex = value.indexOf(target.endMarker, contentStart);
+        if (endIndex === -1) {
+            throw new Error(`模型没有返回第 ${target.ordinal} 个块的结束标记，已拒绝应用。`);
+        }
+
+        const rawText = value.slice(contentStart, endIndex).trim();
+        if (!rawText) {
+            throw new Error(`第 ${target.ordinal} 个块的修复结果为空，已拒绝应用。`);
+        }
+
+        return {
+            target,
+            text: normalizeBlockOutput(rawText, target),
+        };
+    });
+
+    return {
+        type: 'multi_block_replacements',
+        replacements,
+    };
+}
+
+function normalizeMultiBlockOutput(output, evidence) {
+    const payload = parseMultiBlockPreview(output, evidence);
+    return payload.replacements
+        .map(({ target, text }) => `${target.startMarker}\n${text}\n${target.endMarker}`)
+        .join('\n\n');
+}
+
 function getPreviewTextForApply() {
     const preview = String(document.getElementById('rr-preview')?.value || '').trim();
     if (!preview) {
@@ -2237,9 +2493,16 @@ function getPreviewTextForApply() {
     }
 
     if (runtime.active?.mode === 'repair_block') {
-        const evidence = runtime.active.blockEvidence
-            || prepareBlockEvidence(runtime.active, '', document.getElementById('rr-source')?.value || '');
+        const evidence = runtime.active.blockEvidence || (
+            getSelectedBlockIndexes().length > 1
+                ? prepareMultiBlockEvidence(runtime.active, '')
+                : prepareBlockEvidence(runtime.active, '', document.getElementById('rr-source')?.value || '')
+        );
         runtime.active.blockEvidence = evidence;
+        if (evidence.applyMode === 'replace_multiple_blocks') {
+            return parseMultiBlockPreview(preview, evidence);
+        }
+
         return normalizeBlockOutput(preview, evidence);
     }
 
@@ -2301,7 +2564,34 @@ function buildRepairedMessageText(active, replacementText) {
             throw new Error('没有可用的状态栏应用方式。');
         }
         case 'repair_block': {
-            const evidence = active.blockEvidence || prepareBlockEvidence(active, '', document.getElementById('rr-source')?.value || '');
+            const evidence = active.blockEvidence || (
+                replacementText?.type === 'multi_block_replacements' || getSelectedBlockIndexes().length > 1
+                    ? prepareMultiBlockEvidence(active, '')
+                    : prepareBlockEvidence(active, '', document.getElementById('rr-source')?.value || '')
+            );
+
+            if (evidence.applyMode === 'replace_multiple_blocks') {
+                const payload = replacementText?.type === 'multi_block_replacements'
+                    ? replacementText
+                    : parseMultiBlockPreview(String(replacementText || ''), evidence);
+                let result = currentText;
+
+                for (const { target, text } of [...payload.replacements].sort((a, b) => b.target.start - a.target.start)) {
+                    const range = resolveCurrentBlockRange(result, target, target.label || '结构块');
+                    result = `${result.slice(0, range.start)}${text}${result.slice(range.end)}`;
+                }
+
+                return result;
+            }
+
+            if (evidence.applyMode === 'replace_recognized') {
+                const range = resolveCurrentBlockRange(currentText, {
+                    text: evidence.applyTarget,
+                    start: evidence.applyStart,
+                    end: evidence.applyEnd,
+                }, getBlockTypeLabel(evidence.blockKind));
+                return `${currentText.slice(0, range.start)}${replacementText}${currentText.slice(range.end)}`;
+            }
 
             if (evidence.applyMode === 'replace_selection' || evidence.applyMode === 'replace_manual' || evidence.applyMode === 'replace_block') {
                 if (!evidence.applyTarget || !currentText.includes(evidence.applyTarget)) {
@@ -2373,7 +2663,9 @@ async function generatePreview() {
         if (runtime.active.mode === 'repair_statebar') {
             clean = normalizeStatusOutput(output);
         } else if (runtime.active.mode === 'repair_block') {
-            clean = normalizeBlockOutput(output, runtime.active.blockEvidence);
+            clean = runtime.active.blockEvidence?.applyMode === 'replace_multiple_blocks'
+                ? normalizeMultiBlockOutput(output, runtime.active.blockEvidence)
+                : normalizeBlockOutput(output, runtime.active.blockEvidence);
         }
 
         if (!clean.trim()) {
@@ -2381,7 +2673,9 @@ async function generatePreview() {
         }
 
         preview.value = clean;
-        status.textContent = '已生成预览。确认无误后再应用到当前回复。';
+        status.textContent = runtime.active.blockEvidence?.applyMode === 'replace_multiple_blocks'
+            ? `已生成 ${runtime.active.blockEvidence.targets.length} 个块的预览。确认无误后会分别替换这些原始块。`
+            : '已生成预览。确认无误后再应用到当前回复。';
     } catch (error) {
         const message = error?.message || String(error);
         status.textContent = message;
@@ -2519,7 +2813,7 @@ function refreshModalSource() {
         }
     } else {
         runtime.recognizedBlocks = [];
-        runtime.selectedBlockIndex = -1;
+        resetRecognizedBlockSelection();
         runtime.active.selectedBlockKind = 'auto';
     }
 }
@@ -2640,24 +2934,95 @@ function setBlockSource(kind) {
     document.getElementById('rr-modal-status').textContent = '';
 }
 
-function selectRecognizedBlock(index, { refreshTemplates = false } = {}) {
-    const block = runtime.recognizedBlocks[index];
-    if (!runtime.active || !block) {
+function formatSelectedBlocksSource(blocks) {
+    if (blocks.length === 1) {
+        return blocks[0].text;
+    }
+
+    return blocks
+        .map(block => `【${block.selectedIndex + 1}. ${block.label}】\n${block.text}`)
+        .join('\n\n--- 回复救急分隔 ---\n\n');
+}
+
+function syncRecognizedBlockSelectionUi() {
+    const selected = new Set(getSelectedBlockIndexes());
+    document.querySelectorAll('.rr-block-item').forEach((item) => {
+        const index = Number(item.dataset.index);
+        const active = selected.has(index);
+        item.classList.toggle('active', active);
+        item.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+}
+
+function updateSelectedRecognizedBlocks({ refreshTemplates = false } = {}) {
+    if (!runtime.active) {
         return;
     }
 
-    runtime.selectedBlockIndex = index;
+    const blocks = getSelectedRecognizedBlocks();
     runtime.active.blockEvidence = null;
-    runtime.active.selectedBlockKind = isKnownBlockKind(block.blockKind) ? block.blockKind : 'custom';
-    document.querySelectorAll('.rr-block-item').forEach((item) => {
-        item.classList.toggle('active', Number(item.dataset.index) === index);
-    });
+    syncRecognizedBlockSelectionUi();
 
-    document.getElementById('rr-source').value = block.text;
-    document.getElementById('rr-target-title').textContent = `${block.label} 原文`;
-    document.getElementById('rr-source-warning').textContent = `已选中第 ${index + 1} 个块：${block.label}。应用时只替换这段原始消息文本。`;
-    document.getElementById('rr-preview').value = '';
-    document.getElementById('rr-modal-status').textContent = '';
+    const sourceElement = document.getElementById('rr-source');
+    const titleElement = document.getElementById('rr-target-title');
+    const warningElement = document.getElementById('rr-source-warning');
+    const previewElement = document.getElementById('rr-preview');
+    const statusElement = document.getElementById('rr-modal-status');
+
+    if (!blocks.length) {
+        runtime.selectedBlockIndex = -1;
+        runtime.active.selectedBlockKind = 'auto';
+        if (sourceElement) {
+            sourceElement.value = '';
+        }
+        if (titleElement) {
+            titleElement.textContent = '块原文';
+        }
+        if (warningElement) {
+            warningElement.textContent = '没有选中块；请先在左侧点选一个或多个识别结果。';
+        }
+        if (previewElement) {
+            previewElement.value = '';
+        }
+        if (statusElement) {
+            statusElement.textContent = '';
+        }
+        return;
+    }
+
+    if (blocks.length === 1) {
+        const block = blocks[0];
+        runtime.selectedBlockIndex = block.selectedIndex;
+        runtime.active.selectedBlockKind = isKnownBlockKind(block.blockKind) ? block.blockKind : 'custom';
+        if (sourceElement) {
+            sourceElement.value = block.text;
+        }
+        if (titleElement) {
+            titleElement.textContent = `${block.label} 原文`;
+        }
+        if (warningElement) {
+            warningElement.textContent = `已选中第 ${block.selectedIndex + 1} 个块：${block.label}。应用时只替换这段原始消息文本。`;
+        }
+    } else {
+        runtime.selectedBlockIndex = blocks[0].selectedIndex;
+        runtime.active.selectedBlockKind = 'auto';
+        if (sourceElement) {
+            sourceElement.value = formatSelectedBlocksSource(blocks);
+        }
+        if (titleElement) {
+            titleElement.textContent = `已选 ${blocks.length} 个块`;
+        }
+        if (warningElement) {
+            warningElement.textContent = `已选择 ${blocks.length} 个块；生成预览会按同一条要求分别修复，应用时只替换这些原始消息文本。`;
+        }
+    }
+
+    if (previewElement) {
+        previewElement.value = '';
+    }
+    if (statusElement) {
+        statusElement.textContent = '';
+    }
 
     if (refreshTemplates) {
         runtime.active.blockTemplateCandidates = [];
@@ -2667,17 +3032,37 @@ function selectRecognizedBlock(index, { refreshTemplates = false } = {}) {
     }
 }
 
+function toggleRecognizedBlockSelection(index, { refreshTemplates = false } = {}) {
+    if (!runtime.active || !runtime.recognizedBlocks[index]) {
+        return;
+    }
+
+    const selected = ensureSelectedBlockIndexSet();
+    if (selected.has(index)) {
+        selected.delete(index);
+        runtime.selectedBlockIndex = getSelectedBlockIndexes()[0] ?? -1;
+    } else {
+        selected.add(index);
+        runtime.selectedBlockIndex = index;
+    }
+
+    updateSelectedRecognizedBlocks({ refreshTemplates });
+}
+
 function renderRecognizedBlocks(preferredIndex = 0, { refreshTemplates = false } = {}) {
     const list = document.getElementById('rr-block-list');
     if (!runtime.active || !list) {
         return;
     }
 
+    const previousSelectedKeys = new Set(
+        getSelectedRecognizedBlocks().map(getRecognizedBlockSelectionKey).filter(Boolean),
+    );
     const currentText = getMessageText(runtime.active.messageId);
     const templateText = getCurrentTemplateEvidenceText();
     runtime.recognizedBlocks = collectRecognizedBlocks(currentText, getSettings(), templateText);
     const previousIndex = Number.isInteger(preferredIndex) ? preferredIndex : runtime.selectedBlockIndex;
-    runtime.selectedBlockIndex = -1;
+    resetRecognizedBlockSelection();
     list.replaceChildren();
 
     if (!runtime.recognizedBlocks.length) {
@@ -2698,9 +3083,14 @@ function renderRecognizedBlocks(preferredIndex = 0, { refreshTemplates = false }
         button.type = 'button';
         button.className = 'rr-block-item';
         button.dataset.index = String(index);
+        button.setAttribute('aria-pressed', 'false');
+        button.title = '点击选择或取消，可多选后一次修复';
         button.innerHTML = `
             <span class="rr-block-item-top">
-                <strong></strong>
+                <span class="rr-block-title-line">
+                    <span class="rr-block-check" aria-hidden="true"><i class="fa-solid fa-check"></i></span>
+                    <strong></strong>
+                </span>
                 <em></em>
             </span>
             <span class="rr-block-item-preview"></span>
@@ -2708,12 +3098,23 @@ function renderRecognizedBlocks(preferredIndex = 0, { refreshTemplates = false }
         button.querySelector('strong').textContent = `${index + 1}. ${block.label}`;
         button.querySelector('em').textContent = block.source;
         button.querySelector('.rr-block-item-preview').textContent = block.preview || '空块';
-        button.addEventListener('click', () => selectRecognizedBlock(index, { refreshTemplates: true }));
+        button.addEventListener('click', () => toggleRecognizedBlockSelection(index, { refreshTemplates: true }));
         list.append(button);
     });
 
-    const nextIndex = runtime.recognizedBlocks[previousIndex] ? previousIndex : 0;
-    selectRecognizedBlock(nextIndex, { refreshTemplates });
+    runtime.recognizedBlocks.forEach((block, index) => {
+        if (previousSelectedKeys.has(getRecognizedBlockSelectionKey(block))) {
+            ensureSelectedBlockIndexSet().add(index);
+        }
+    });
+
+    if (!getSelectedBlockIndexes().length) {
+        const nextIndex = runtime.recognizedBlocks[previousIndex] ? previousIndex : 0;
+        ensureSelectedBlockIndexSet().add(nextIndex);
+        runtime.selectedBlockIndex = nextIndex;
+    }
+
+    updateSelectedRecognizedBlocks({ refreshTemplates });
 }
 
 function composeInstructionForActive(mode, instruction) {
@@ -2721,7 +3122,7 @@ function composeInstructionForActive(mode, instruction) {
     const base = String(instruction || '').trim();
 
     if (mode === 'repair_block') {
-        parts.push('本次操作：按用户要求修改当前选中的目标块。除非用户明确要求“重新生成整个块”，否则只改必要内容，其他字段和值保持原样。');
+        parts.push('本次操作：按用户要求修改当前选中的目标块；如果选中多个块，就分别修改每个块。除非用户明确要求“重新生成整个块”，否则只改必要内容，其他字段和值保持原样。');
     }
 
     if (base) {
@@ -2801,7 +3202,7 @@ function openRescueModal(messageId, messageElement) {
         templateScanToken: 0,
     };
     runtime.recognizedBlocks = [];
-    runtime.selectedBlockIndex = -1;
+    resetRecognizedBlockSelection();
 
     document.getElementById('rr-mode').value = initialMode;
     runtime.active.selectedBlockKind = 'auto';
@@ -2846,7 +3247,7 @@ function openBlockRescueUi({ keepInstruction = false } = {}) {
         templateScanToken: 0,
     };
     runtime.recognizedBlocks = [];
-    runtime.selectedBlockIndex = -1;
+    resetRecognizedBlockSelection();
 
     const modeElement = document.getElementById('rr-mode');
     const markerHintElement = document.getElementById('rr-block-marker-hint');
@@ -2877,7 +3278,7 @@ function openBlockRescueUi({ keepInstruction = false } = {}) {
     document.getElementById('rr-modal').hidden = false;
 
     refreshModalSource();
-    const scannedMessage = '已扫描当前聊天最后一条助手回复。点左侧块，再写修改要求。';
+    const scannedMessage = '已扫描当前聊天最后一条助手回复。点选左侧一个或多个块，再写修改要求。';
     document.getElementById('rr-modal-status').textContent = scannedMessage;
     void refreshBlockTemplateEvidence({ silent: true }).then(() => {
         if (runtime.active?.editor === 'block_ui') {
@@ -2893,7 +3294,7 @@ function closeRescueModal() {
     document.getElementById('rr-modal').hidden = true;
     runtime.active = null;
     runtime.recognizedBlocks = [];
-    runtime.selectedBlockIndex = -1;
+    resetRecognizedBlockSelection();
 }
 
 function resetModalForChatChange() {
@@ -2903,7 +3304,7 @@ function resetModalForChatChange() {
     } else {
         runtime.active = null;
         runtime.recognizedBlocks = [];
-        runtime.selectedBlockIndex = -1;
+        resetRecognizedBlockSelection();
     }
 }
 
@@ -3225,7 +3626,7 @@ function mountSettings() {
                     <label>
                         <span>上下文字符数</span>
                         <small class="rr-help">发送给模型的最近上下文总字数，越大越稳但更费 token。</small>
-                        <input id="rr-setting-context-length" class="text_pole" type="number" min="300" max="6000" step="100">
+                        <input id="rr-setting-context-length" class="text_pole" type="number" min="300" max="${CONTEXT_LENGTH_MAX}" step="100">
                     </label>
                     <label>
                         <span>最近消息数</span>
@@ -3235,7 +3636,7 @@ function mountSettings() {
                     <label>
                         <span>修复输出长度</span>
                         <small class="rr-help">限制模型本次急救输出长度，避免整段重写失控。</small>
-                        <input id="rr-setting-response-length" class="text_pole" type="number" min="80" max="4000" step="20">
+                        <input id="rr-setting-response-length" class="text_pole" type="number" min="80" max="${RESPONSE_LENGTH_MAX}" step="20">
                     </label>
                 </div>
             </div>
@@ -3262,7 +3663,7 @@ function mountSettings() {
         notify('info', addedCount ? `已新增 ${addedCount} 个回复救急入口。` : '已扫描，当前可见消息没有缺失入口。');
     });
     bind('rr-setting-context-length', 'change', (event) => {
-        getSettings().contextLength = clampInteger(event.currentTarget.value, defaultSettings.contextLength, 300, 6000);
+        getSettings().contextLength = clampInteger(event.currentTarget.value, defaultSettings.contextLength, 300, CONTEXT_LENGTH_MAX);
         event.currentTarget.value = String(getSettings().contextLength);
         saveSettingsDebounced();
     });
@@ -3272,7 +3673,7 @@ function mountSettings() {
         saveSettingsDebounced();
     });
     bind('rr-setting-response-length', 'change', (event) => {
-        getSettings().responseLength = clampInteger(event.currentTarget.value, defaultSettings.responseLength, 80, 4000);
+        getSettings().responseLength = clampInteger(event.currentTarget.value, defaultSettings.responseLength, 80, RESPONSE_LENGTH_MAX);
         event.currentTarget.value = String(getSettings().responseLength);
         saveSettingsDebounced();
     });

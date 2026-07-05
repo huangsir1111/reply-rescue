@@ -239,12 +239,51 @@
     filter: brightness(1.08);
 }
 
+.rr-block-item.active {
+    background: color-mix(in srgb, var(--SmartThemeQuoteColor) 13%, transparent);
+}
+
 .rr-block-item-top {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 8px;
     margin-bottom: 5px;
+}
+
+.rr-block-title-line {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+}
+
+.rr-block-check {
+    flex: 0 0 auto;
+    width: 18px;
+    height: 18px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 4px;
+    font-size: 0.68rem;
+    opacity: 0.72;
+}
+
+.rr-block-check i {
+    opacity: 0;
+}
+
+.rr-block-item.active .rr-block-check {
+    border-color: var(--SmartThemeQuoteColor);
+    background: var(--SmartThemeQuoteColor);
+    color: var(--SmartThemeBlurTintColor);
+    opacity: 1;
+}
+
+.rr-block-item.active .rr-block-check i {
+    opacity: 1;
 }
 
 .rr-block-item-top strong {
