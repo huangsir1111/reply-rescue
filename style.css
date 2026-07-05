@@ -243,6 +243,16 @@
     background: color-mix(in srgb, var(--SmartThemeQuoteColor) 13%, transparent);
 }
 
+.rr-block-item.missing {
+    border-style: dashed;
+    background: color-mix(in srgb, var(--SmartThemeQuoteColor) 7%, transparent);
+}
+
+.rr-block-item.missing .rr-block-item-top em {
+    color: var(--SmartThemeQuoteColor);
+    opacity: 0.95;
+}
+
 .rr-block-item-top {
     display: flex;
     align-items: center;

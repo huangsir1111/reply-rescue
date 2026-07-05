@@ -23,12 +23,15 @@ import { textgenerationwebui_preset_names, textgenerationwebui_presets, textgene
 
 const MODULE_NAME = 'reply_rescue';
 const DISPLAY_NAME = '回复救急插件';
-const SETTINGS_VERSION = '0.1.12';
+const SETTINGS_VERSION = '0.1.16';
 const MAX_UNDO_RECORDS = 10;
 const WORLD_INFO_METADATA_KEY = 'world_info';
+const CHAT_BASELINE_METADATA_KEY = 'blockBaseline';
 const MULTI_BLOCK_MARKER_PREFIX = 'RR_SELECTED_BLOCK';
 const CONTEXT_LENGTH_MAX = 100000;
 const RESPONSE_LENGTH_MAX = 20000;
+const BLOCK_DETECTION_MAX = 100000;
+const BASELINE_EXAMPLE_MAX = 20000;
 
 const modeLabels = {
     rewrite_selection: '重写选中片段',
@@ -104,6 +107,7 @@ const runtime = {
     recognizedBlocks: [],
     selectedBlockIndex: -1,
     selectedBlockIndexes: new Set(),
+    selectionSnapshot: null,
 };
 
 function cloneDefaultValue(value) {
@@ -239,6 +243,260 @@ function stripWrappingCodeFence(text) {
     }
 
     return value;
+}
+
+function decodeHtmlEntity(entity) {
+    const value = String(entity || '');
+    if (!value) {
+        return '';
+    }
+
+    const numeric = value.match(/^&#(x?[0-9a-f]+);$/iu);
+    if (numeric) {
+        const codePoint = Number.parseInt(
+            numeric[1].startsWith('x') || numeric[1].startsWith('X') ? numeric[1].slice(1) : numeric[1],
+            numeric[1].startsWith('x') || numeric[1].startsWith('X') ? 16 : 10,
+        );
+        if (Number.isFinite(codePoint)) {
+            try {
+                return String.fromCodePoint(codePoint);
+            } catch {
+                return value;
+            }
+        }
+    }
+
+    if (typeof document !== 'undefined') {
+        const textarea = document.createElement('textarea');
+        textarea.innerHTML = value;
+        return textarea.value || value;
+    }
+
+    return value
+        .replace(/&nbsp;/giu, ' ')
+        .replace(/&amp;/giu, '&')
+        .replace(/&lt;/giu, '<')
+        .replace(/&gt;/giu, '>')
+        .replace(/&quot;/giu, '"')
+        .replace(/&#39;/giu, "'");
+}
+
+function pushVisibleMappedChar(output, starts, ends, char, rawStart, rawEnd) {
+    for (const unit of String(char || '')) {
+        output.push(unit);
+        starts.push(rawStart);
+        ends.push(rawEnd);
+    }
+}
+
+function normalizeMappedLineBreaks(chars, starts, ends) {
+    const output = [];
+    const nextStarts = [];
+    const nextEnds = [];
+
+    for (let index = 0; index < chars.length; index += 1) {
+        const char = chars[index];
+        if (char === '\r') {
+            const hasLf = chars[index + 1] === '\n';
+            output.push('\n');
+            nextStarts.push(starts[index]);
+            nextEnds.push(hasLf ? ends[index + 1] : ends[index]);
+            if (hasLf) {
+                index += 1;
+            }
+            continue;
+        }
+
+        output.push(char);
+        nextStarts.push(starts[index]);
+        nextEnds.push(ends[index]);
+    }
+
+    return {
+        text: output.join(''),
+        starts: nextStarts,
+        ends: nextEnds,
+    };
+}
+
+function buildVisibleTextMap(rawText) {
+    const source = String(rawText || '');
+    const output = [];
+    const starts = [];
+    const ends = [];
+    let index = 0;
+
+    while (index < source.length) {
+        const char = source[index];
+
+        if (char === '<') {
+            const commentEnd = source.startsWith('<!--', index) ? source.indexOf('-->', index + 4) : -1;
+            if (commentEnd !== -1) {
+                index = commentEnd + 3;
+                continue;
+            }
+
+            const tagMatch = source.slice(index).match(/^<\/?\s*([^\s/>=]+)[^>]*>/u);
+            if (tagMatch) {
+                const tag = tagMatch[0];
+                const tagName = String(tagMatch[1] || '').toLowerCase();
+                if (tagName === 'br') {
+                    pushVisibleMappedChar(output, starts, ends, '\n', index, index + tag.length);
+                } else if (['div', 'section', 'article', 'aside', 'details', 'summary', 'table', 'tr', 'ul', 'ol', 'li', 'pre', 'p'].includes(tagName)) {
+                    pushVisibleMappedChar(output, starts, ends, '\n', index, index + tag.length);
+                }
+                index += tag.length;
+                continue;
+            }
+        }
+
+        if (char === '&') {
+            const entityMatch = source.slice(index).match(/^&(?:#x?[0-9a-f]+|[a-z][a-z0-9]+);/iu);
+            if (entityMatch) {
+                pushVisibleMappedChar(output, starts, ends, decodeHtmlEntity(entityMatch[0]), index, index + entityMatch[0].length);
+                index += entityMatch[0].length;
+                continue;
+            }
+        }
+
+        if ((char === '*' || char === '_' || char === '`') && (source[index - 1] === char || source[index + 1] === char)) {
+            index += 1;
+            continue;
+        }
+
+        pushVisibleMappedChar(output, starts, ends, char, index, index + 1);
+        index += 1;
+    }
+
+    return normalizeMappedLineBreaks(output, starts, ends);
+}
+
+function normalizeSearchTextWithMap(text, starts = [], ends = []) {
+    const source = normalizeLineBreaks(text);
+    const output = [];
+    const map = [];
+    let pendingSpace = null;
+
+    for (let index = 0; index < source.length; index += 1) {
+        const char = source[index];
+        const rawStart = starts[index] ?? index;
+        const rawEnd = ends[index] ?? index + 1;
+
+        if (/\s/u.test(char)) {
+            if (output.length) {
+                pendingSpace ||= { start: rawStart, end: rawEnd };
+            }
+            continue;
+        }
+
+        if (pendingSpace && output[output.length - 1] !== ' ') {
+            output.push(' ');
+            map.push(pendingSpace);
+        }
+        pendingSpace = null;
+        output.push(char);
+        map.push({ start: rawStart, end: rawEnd });
+    }
+
+    return {
+        text: output.join(''),
+        map,
+    };
+}
+
+function findAllSearchIndexes(haystack, needle) {
+    const indexes = [];
+    if (!needle) {
+        return indexes;
+    }
+
+    let index = 0;
+    while (index <= haystack.length) {
+        const found = haystack.indexOf(needle, index);
+        if (found === -1) {
+            break;
+        }
+        indexes.push(found);
+        index = found + Math.max(needle.length, 1);
+    }
+
+    return indexes;
+}
+
+function locateRawSelectionRange(currentText, selectedText, hint = {}) {
+    const source = String(currentText || '');
+    const selected = String(selectedText || '');
+    if (!source || !selected.trim()) {
+        return null;
+    }
+
+    const hintedStart = Number(hint.rawStart ?? hint.start);
+    const hintedEnd = Number(hint.rawEnd ?? hint.end);
+    const hintedText = String(hint.selectedRawText || hint.rawText || '');
+    if (
+        Number.isInteger(hintedStart)
+        && Number.isInteger(hintedEnd)
+        && hintedStart >= 0
+        && hintedEnd > hintedStart
+        && hintedEnd <= source.length
+        && (!hintedText || source.slice(hintedStart, hintedEnd) === hintedText)
+    ) {
+        return {
+            start: hintedStart,
+            end: hintedEnd,
+            text: source.slice(hintedStart, hintedEnd),
+        };
+    }
+
+    const exactText = hintedText || selected;
+    const exactMatches = findAllIndexes(source, exactText);
+    if (exactMatches.length === 1) {
+        return {
+            start: exactMatches[0],
+            end: exactMatches[0] + exactText.length,
+            text: source.slice(exactMatches[0], exactMatches[0] + exactText.length),
+        };
+    }
+
+    const visible = buildVisibleTextMap(source);
+    const normalizedVisible = normalizeSearchTextWithMap(visible.text, visible.starts, visible.ends);
+    const normalizedSelected = normalizeSearchTextWithMap(selected).text;
+    if (!normalizedSelected) {
+        return null;
+    }
+
+    const matches = findAllSearchIndexes(normalizedVisible.text, normalizedSelected);
+    if (!matches.length) {
+        return null;
+    }
+
+    let chosen = matches[0];
+    const normalizedStartHint = Number(hint.normalizedStart);
+    if (matches.length > 1 && Number.isFinite(normalizedStartHint) && normalizedStartHint >= 0) {
+        chosen = matches
+            .map(index => ({ index, distance: Math.abs(index - normalizedStartHint) }))
+            .sort((a, b) => a.distance - b.distance)[0].index;
+    } else if (matches.length > 1) {
+        return null;
+    }
+
+    const first = normalizedVisible.map[chosen];
+    const last = normalizedVisible.map[chosen + normalizedSelected.length - 1];
+    if (!first || !last) {
+        return null;
+    }
+
+    const start = first.start;
+    const end = last.end;
+    if (!Number.isInteger(start) || !Number.isInteger(end) || end <= start) {
+        return null;
+    }
+
+    return {
+        start,
+        end,
+        text: source.slice(start, end),
+    };
 }
 
 function countOccurrences(text, needle) {
@@ -649,7 +907,7 @@ function findStructureBlocks(text, blockKind = 'auto', settings = getSettings(),
     while ((match = xmlRegex.exec(source))) {
         const tagName = match[1];
         const blockText = match[0];
-        if (blockText.length > 12000 || !isLikelyBlockTagName(tagName, blockKind)) {
+        if (blockText.length > BLOCK_DETECTION_MAX || !isLikelyBlockTagName(tagName, blockKind)) {
             continue;
         }
         if (blockKind !== 'auto' && scoreTextForBlockKind(`${tagName}\n${blockText}`, blockKind) <= 0) {
@@ -714,7 +972,7 @@ function findBracketStructureBlocks(text) {
             }
 
             const endExclusive = endIndex + end.length;
-            if (endExclusive - match.index > 12000) {
+            if (endExclusive - match.index > BLOCK_DETECTION_MAX) {
                 continue;
             }
 
@@ -727,6 +985,39 @@ function findBracketStructureBlocks(text) {
                 source: '成对标记',
             });
         }
+    }
+
+    return blocks;
+}
+
+function findMarkdownCodeFenceBlocks(text) {
+    const source = String(text || '');
+    const blocks = [];
+    const fenceRegex = /(^|\n)([ \t]{0,3})(`{3,}|~{3,})([^\r\n]*)\r?\n([\s\S]*?)\r?\n\2\3[ \t]*(?=\r?\n|$)/gu;
+    let match;
+
+    while ((match = fenceRegex.exec(source))) {
+        const start = match.index + match[1].length;
+        const end = match.index + match[0].length;
+        const textValue = source.slice(start, end);
+        if (textValue.length > BLOCK_DETECTION_MAX) {
+            continue;
+        }
+
+        const info = String(match[4] || '').trim();
+        const body = String(match[5] || '');
+        if (!body.trim()) {
+            continue;
+        }
+
+        blocks.push({
+            start,
+            end,
+            text: textValue,
+            markerPair: [`${match[2]}${match[3]}${match[4] || ''}`, `${match[2]}${match[3]}`],
+            markerName: info ? `代码块.${info.split(/\s+/u)[0]}` : '代码块',
+            source: 'Markdown代码块',
+        });
     }
 
     return blocks;
@@ -765,21 +1056,54 @@ function getHtmlBlockLabel(openTag) {
     return hint ? `${tagName}.${hint.split(/\s+/u)[0]}` : `${tagName} 美化块`;
 }
 
+function hasHtmlIslandAttributes(openTag) {
+    return /\b(?:class|id|style)\s*=|data-|aria-/iu.test(String(openTag || ''));
+}
+
+function isHtmlIslandCandidate(openTag, tagName, textValue) {
+    const lower = String(tagName || '').toLowerCase();
+    const body = String(textValue || '');
+    if (hasHtmlIslandAttributes(openTag)) {
+        return true;
+    }
+
+    if (lower === 'details') {
+        return /<\s*summary\b/iu.test(body) || body.length >= 160;
+    }
+
+    if (lower === 'pre') {
+        return /<\s*code\b/iu.test(body) || body.length >= 160;
+    }
+
+    if (lower === 'table') {
+        return /<\s*(?:thead|tbody|tr|td|th)\b/iu.test(body) && body.length >= 120;
+    }
+
+    if (lower === 'ul' || lower === 'ol') {
+        return /<\s*li\b/iu.test(body) && body.length >= 160;
+    }
+
+    return false;
+}
+
 function findHtmlIslandBlocks(text) {
     const source = String(text || '');
     const blocks = [];
-    const startRegex = /<(div|section|article|aside|details|table|ul|ol|pre)\b(?=[^>]*(?:class\s*=|id\s*=|style\s*=|data-|aria-))[^>]*>/giu;
+    const startRegex = /<(div|section|article|aside|details|table|ul|ol|pre)\b[^>]*>/giu;
     let match;
 
     while ((match = startRegex.exec(source))) {
         const tagName = match[1];
         const endExclusive = findMatchingHtmlEnd(source, match.index, tagName);
-        if (endExclusive === -1 || endExclusive - match.index > 16000) {
+        if (endExclusive === -1 || endExclusive - match.index > BLOCK_DETECTION_MAX) {
             continue;
         }
 
         const textValue = source.slice(match.index, endExclusive);
         if (!/[\r\n]/u.test(textValue) && textValue.length < 80) {
+            continue;
+        }
+        if (!isHtmlIslandCandidate(match[0], tagName, textValue)) {
             continue;
         }
 
@@ -794,6 +1118,174 @@ function findHtmlIslandBlocks(text) {
     }
 
     return blocks;
+}
+
+function findBrokenHtmlIslandEnd(source, fromIndex, tagName = '') {
+    if (String(tagName || '').toLowerCase() === 'details') {
+        return source.length;
+    }
+
+    const tail = source.slice(fromIndex);
+    const nextTopLevel = tail.search(/\n{2,}(?=(?:<\s*(?:div|section|article|aside|details|table|ul|ol|pre)\b|\[[^\]\r\n]{1,80}\]|【[^】\r\n]{1,80}】|「[^」\r\n]{1,80}」))/u);
+    if (nextTopLevel !== -1) {
+        return fromIndex + nextTopLevel;
+    }
+
+    return source.length;
+}
+
+function findBrokenHtmlIslandBlocks(text) {
+    const source = String(text || '');
+    const blocks = [];
+    const startRegex = /<(div|section|article|aside|details|table|ul|ol|pre)\b[^>]*>/giu;
+    let match;
+
+    while ((match = startRegex.exec(source))) {
+        const tagName = match[1];
+        if (findMatchingHtmlEnd(source, match.index, tagName) !== -1) {
+            continue;
+        }
+
+        const endExclusive = findBrokenHtmlIslandEnd(source, match.index + match[0].length, tagName);
+        if (endExclusive <= match.index || endExclusive - match.index > BLOCK_DETECTION_MAX) {
+            continue;
+        }
+
+        const textValue = source.slice(match.index, endExclusive).trimEnd();
+        if (!isHtmlIslandCandidate(match[0], tagName, textValue) && !/<\s*summary\b|<\/?\s*(?:div|section|article|aside|table|ul|ol|li|button)\b/iu.test(textValue)) {
+            continue;
+        }
+
+        blocks.push({
+            start: match.index,
+            end: match.index + textValue.length,
+            text: textValue,
+            markerPair: [match[0], `</${tagName}>`],
+            markerName: `${getHtmlBlockLabel(match[0])}（疑似损坏）`,
+            source: '疑似坏块',
+        });
+    }
+
+    return blocks;
+}
+
+function panelGapLooksSafe(gap) {
+    const value = String(gap || '').trim();
+    if (!value) {
+        return true;
+    }
+
+    if (value.length > 600) {
+        return false;
+    }
+
+    if (/[。！？!?]\s*[\p{L}\p{N}]/u.test(value)) {
+        return false;
+    }
+
+    return /<\/?\s*[a-z][^>]*>/iu.test(value)
+        || /^[\s`~*_=\-+|:：,，;；.。·•#()[\]{}【】「」<>\/\\]+$/iu.test(value);
+}
+
+function findEnclosingHtmlContainer(source, start, end) {
+    const startRegex = /<(div|section|article|aside|details|table|ul|ol|pre)\b[^>]*>/giu;
+    let match;
+    let best = null;
+
+    while ((match = startRegex.exec(source))) {
+        if (match.index > start) {
+            break;
+        }
+
+        const tagName = match[1];
+        const endExclusive = findMatchingHtmlEnd(source, match.index, tagName);
+        if (endExclusive < end || endExclusive - match.index > BLOCK_DETECTION_MAX) {
+            continue;
+        }
+
+        const textValue = source.slice(match.index, endExclusive);
+        if (!best || (endExclusive - match.index) < (best.end - best.start)) {
+            best = {
+                start: match.index,
+                end: endExclusive,
+                text: textValue,
+                openTag: match[0],
+                tagName,
+            };
+        }
+    }
+
+    return best;
+}
+
+function combineAdjacentPanelBlocks(blocks, sourceText) {
+    const source = String(sourceText || '');
+    const sorted = [...blocks].sort((a, b) => a.start - b.start || a.end - b.end);
+    const combined = [];
+    let group = [];
+
+    const flush = () => {
+        if (group.length < 2) {
+            group = [];
+            return;
+        }
+
+        const first = group[0];
+        const last = group[group.length - 1];
+        if (last.end - first.start > BLOCK_DETECTION_MAX) {
+            group = [];
+            return;
+        }
+
+        const htmlLikeCount = group.filter(block => /HTML|坏块|美化|面板/u.test(String(block.source || '')) || /^<[^>]+>/.test(block.text)).length;
+        if (htmlLikeCount < 2) {
+            group = [];
+            return;
+        }
+
+        const enclosing = findEnclosingHtmlContainer(source, first.start, last.end);
+        const start = enclosing?.start ?? first.start;
+        const end = enclosing?.end ?? last.end;
+        const text = source.slice(start, end);
+        if (!text.trim() || text.length > BLOCK_DETECTION_MAX) {
+            group = [];
+            return;
+        }
+
+        combined.push({
+            start,
+            end,
+            text,
+            markerPair: enclosing ? [enclosing.openTag, `</${enclosing.tagName}>`] : first.markerPair,
+            markerName: enclosing ? getHtmlBlockLabel(enclosing.openTag) : `${getRecognizedBlockLabel(first)} 面板`,
+            source: '组合面板',
+        });
+        group = [];
+    };
+
+    for (const block of sorted) {
+        if (!group.length) {
+            group = [block];
+            continue;
+        }
+
+        const previous = group[group.length - 1];
+        const gap = source.slice(previous.end, block.start);
+        const canJoin = block.start >= previous.end
+            && block.start - previous.end <= 800
+            && block.end - group[0].start <= BLOCK_DETECTION_MAX
+            && panelGapLooksSafe(gap);
+
+        if (canJoin) {
+            group.push(block);
+        } else {
+            flush();
+            group = [block];
+        }
+    }
+
+    flush();
+    return combined;
 }
 
 function getRecognizedBlockLabel(block) {
@@ -829,14 +1321,17 @@ function normalizeRecognizedBlocks(blocks) {
     return result.sort((a, b) => a.start - b.start);
 }
 
-function collectRecognizedBlocks(text, settings = getSettings(), templateText = '') {
+function collectActualRecognizedBlocks(text, settings = getSettings(), templateText = '') {
     const source = String(text || '');
     const parsed = findStructureBlocks(source, 'auto', settings, templateText);
     const blocks = [
         ...parsed.blocks.map(block => ({ ...block, source: '结构标记' })),
         ...findBracketStructureBlocks(source),
+        ...findMarkdownCodeFenceBlocks(source),
         ...findHtmlIslandBlocks(source),
+        ...findBrokenHtmlIslandBlocks(source),
     ];
+    blocks.push(...combineAdjacentPanelBlocks(blocks, source));
 
     return normalizeRecognizedBlocks(blocks).map((block, index) => {
         const inferredKind = inferBlockKindFromText(`${block.markerName || ''}\n${block.text}`);
@@ -852,10 +1347,323 @@ function collectRecognizedBlocks(text, settings = getSettings(), templateText = 
     });
 }
 
+function normalizeBlockSignaturePart(value) {
+    return String(value || '')
+        .replace(/\s+/gu, ' ')
+        .trim()
+        .toLowerCase();
+}
+
+function getBlockSignature(block) {
+    const [startMarker = '', endMarker = ''] = block?.markerPair || [];
+    const blockKind = isKnownBlockKind(block?.blockKind) ? block.blockKind : inferBlockKindFromText(block?.text || '');
+    const label = block?.label || getRecognizedBlockLabel(block || {});
+    return [
+        blockKind,
+        normalizeBlockSignaturePart(startMarker),
+        normalizeBlockSignaturePart(endMarker),
+        normalizeBlockSignaturePart(label),
+    ].join('|');
+}
+
+function annotateBlockOccurrences(blocks) {
+    const counts = new Map();
+    return blocks.map((block, index) => {
+        const signature = getBlockSignature(block);
+        const occurrence = counts.get(signature) || 0;
+        counts.set(signature, occurrence + 1);
+        return {
+            ...block,
+            actualIndex: index,
+            signature,
+            occurrence,
+            identityKey: `${signature}#${occurrence}`,
+        };
+    });
+}
+
+function getReplyRescueChatMetadata() {
+    if (!chat_metadata || typeof chat_metadata !== 'object') {
+        return null;
+    }
+
+    if (!chat_metadata[MODULE_NAME] || typeof chat_metadata[MODULE_NAME] !== 'object') {
+        chat_metadata[MODULE_NAME] = {};
+    }
+
+    return chat_metadata[MODULE_NAME];
+}
+
+function sanitizeChatBlockBaseline(value) {
+    if (!value || typeof value !== 'object' || !Array.isArray(value.blocks) || !value.blocks.length) {
+        return null;
+    }
+
+    const blocks = value.blocks
+        .map((block, index) => {
+            const text = String(block?.text || '');
+            const label = String(block?.label || `结构块 ${index + 1}`);
+            const blockKind = isKnownBlockKind(block?.blockKind) ? block.blockKind : inferBlockKindFromText(`${label}\n${text}`);
+            const markerPair = Array.isArray(block?.markerPair) ? block.markerPair.map(item => String(item || '')) : inferMarkerPairFromBlockText(text);
+            const signature = String(block?.signature || getBlockSignature({ ...block, label, blockKind, markerPair, text }));
+            const occurrence = Number.isInteger(block?.occurrence) ? block.occurrence : index;
+
+            return {
+                order: Number.isInteger(block?.order) ? block.order : index,
+                label,
+                source: String(block?.source || '聊天基准'),
+                blockKind,
+                markerPair,
+                text: trimText(text, BASELINE_EXAMPLE_MAX, false),
+                preview: String(block?.preview || trimText(text.replace(/\s+/gu, ' ').trim(), 120, false)),
+                signature,
+                occurrence,
+                identityKey: `${signature}#${occurrence}`,
+                position: {
+                    start: Number.isInteger(block?.position?.start) ? block.position.start : -1,
+                    end: Number.isInteger(block?.position?.end) ? block.position.end : -1,
+                },
+            };
+        })
+        .sort((a, b) => a.order - b.order);
+
+    return {
+        version: Number(value.version || 1),
+        sourceMessageId: Number.isInteger(value.sourceMessageId) ? value.sourceMessageId : -1,
+        learnedAt: String(value.learnedAt || ''),
+        blockCount: blocks.length,
+        signature: blocks.map(block => block.identityKey).join('\n'),
+        blocks,
+    };
+}
+
+function makeChatBlockBaseline(messageId, blocks) {
+    const annotated = annotateBlockOccurrences(blocks);
+    const baselineBlocks = annotated.map((block, index) => ({
+        order: index,
+        label: block.label || getRecognizedBlockLabel(block),
+        source: block.source || '聊天基准',
+        blockKind: isKnownBlockKind(block.blockKind) ? block.blockKind : inferBlockKindFromText(block.text),
+        markerPair: block.markerPair || inferMarkerPairFromBlockText(block.text),
+        text: trimText(block.text, BASELINE_EXAMPLE_MAX, false),
+        preview: trimText(block.text.replace(/\s+/gu, ' ').trim(), 120, false),
+        signature: block.signature,
+        occurrence: block.occurrence,
+        identityKey: block.identityKey,
+        position: {
+            start: Number.isInteger(block.start) ? block.start : -1,
+            end: Number.isInteger(block.end) ? block.end : -1,
+        },
+    }));
+
+    return sanitizeChatBlockBaseline({
+        version: 1,
+        sourceMessageId: messageId,
+        learnedAt: new Date().toISOString(),
+        blocks: baselineBlocks,
+    });
+}
+
+function findBestChatBlockBaseline(settings = getSettings(), templateText = '', upToMessageId = -1) {
+    const maxMessageId = Number.isInteger(upToMessageId) && upToMessageId >= 0
+        ? Math.min(upToMessageId, (chat?.length || 1) - 1)
+        : (chat?.length || 0) - 1;
+    let best = null;
+
+    for (let messageId = 0; messageId <= maxMessageId; messageId += 1) {
+        const message = getCurrentMessage(messageId);
+        if (!message || message.is_user || message.is_system) {
+            continue;
+        }
+
+        const blocks = collectActualRecognizedBlocks(getMessageText(messageId), settings, templateText);
+        if (!blocks.length) {
+            continue;
+        }
+
+        if (!best || blocks.length > best.blocks.length) {
+            best = {
+                messageId,
+                blocks,
+            };
+        }
+    }
+
+    return best ? makeChatBlockBaseline(best.messageId, best.blocks) : null;
+}
+
+function saveChatBlockBaseline(baseline) {
+    const metadata = getReplyRescueChatMetadata();
+    if (!metadata || !baseline) {
+        return;
+    }
+
+    metadata[CHAT_BASELINE_METADATA_KEY] = baseline;
+    chat_metadata.tainted = true;
+    void saveChatConditional();
+}
+
+function getChatBlockBaseline(settings = getSettings(), templateText = '', activeMessageId = -1) {
+    const metadata = getReplyRescueChatMetadata();
+    const stored = sanitizeChatBlockBaseline(metadata?.[CHAT_BASELINE_METADATA_KEY]);
+    if (stored) {
+        return stored;
+    }
+
+    const candidate = findBestChatBlockBaseline(settings, templateText, activeMessageId);
+    if (candidate) {
+        saveChatBlockBaseline(candidate);
+        return candidate;
+    }
+
+    return null;
+}
+
+function resolveMissingBlockInsertIndex(currentText, missingBlock, recognizedBlocks = runtime.recognizedBlocks) {
+    const baselineIndex = Number(missingBlock?.baselineIndex);
+    const actualBlocks = (recognizedBlocks || [])
+        .filter(block => !block?.isMissing && Number.isInteger(block?.start) && Number.isInteger(block?.end))
+        .filter(block => Number.isInteger(block.baselineIndex));
+
+    const previous = actualBlocks
+        .filter(block => block.baselineIndex < baselineIndex)
+        .sort((a, b) => b.baselineIndex - a.baselineIndex || b.end - a.end)[0];
+    if (previous) {
+        return Math.max(0, Math.min(String(currentText || '').length, previous.end));
+    }
+
+    const next = actualBlocks
+        .filter(block => block.baselineIndex > baselineIndex)
+        .sort((a, b) => a.baselineIndex - b.baselineIndex || a.start - b.start)[0];
+    if (next) {
+        return Math.max(0, Math.min(String(currentText || '').length, next.start));
+    }
+
+    return String(currentText || '').trimEnd().length;
+}
+
+function getRecognizedBlocksForInsertion(currentText, evidence = {}) {
+    const settings = getSettings();
+    const templateText = String(evidence?.template ?? getCurrentTemplateEvidenceText() ?? '');
+    const baseline = getChatBlockBaseline(settings, templateText, runtime.active?.messageId ?? -1);
+    const actualBlocks = collectActualRecognizedBlocks(currentText, settings, templateText);
+    return mergeRecognizedBlocksWithBaseline(actualBlocks, baseline, currentText);
+}
+
+function resolveMissingBlockInsertIndexInText(currentText, missingBlock, evidence = {}) {
+    const recognizedBlocks = getRecognizedBlocksForInsertion(currentText, evidence);
+    return resolveMissingBlockInsertIndex(currentText, missingBlock, recognizedBlocks);
+}
+
+function insertBlockAtPosition(currentText, blockText, insertAt) {
+    const source = String(currentText || '');
+    const value = String(blockText || '').trim();
+    if (!value) {
+        return source;
+    }
+
+    const index = Math.max(0, Math.min(source.length, Number.isInteger(insertAt) ? insertAt : source.trimEnd().length));
+    const before = source.slice(0, index).trimEnd();
+    const after = source.slice(index).trimStart();
+
+    if (!before) {
+        return after ? `${value}\n\n${after}` : value;
+    }
+
+    if (!after) {
+        return `${before}\n\n${value}`;
+    }
+
+    return `${before}\n\n${value}\n\n${after}`;
+}
+
+function mergeRecognizedBlocksWithBaseline(actualBlocks, baseline, currentText) {
+    const actualAnnotated = annotateBlockOccurrences(actualBlocks);
+    if (!baseline?.blocks?.length) {
+        return actualAnnotated.map((block, index) => ({
+            ...block,
+            index,
+            baselineIndex: index,
+            displayOrder: index,
+        }));
+    }
+
+    const baselineByKey = new Map(baseline.blocks.map((block, index) => [block.identityKey, { ...block, baselineIndex: index }]));
+    const matchedBaselineIndexes = new Set();
+    const merged = actualAnnotated.map((block) => {
+        const baselineBlock = baselineByKey.get(block.identityKey);
+        if (baselineBlock) {
+            matchedBaselineIndexes.add(baselineBlock.baselineIndex);
+        }
+
+        return {
+            ...block,
+            isMissing: false,
+            baselineIndex: baselineBlock?.baselineIndex ?? -1,
+            displayOrder: baselineBlock ? baselineBlock.baselineIndex : baseline.blocks.length + block.actualIndex,
+        };
+    });
+
+    for (const [baselineIndex, block] of baseline.blocks.entries()) {
+        if (matchedBaselineIndexes.has(baselineIndex)) {
+            continue;
+        }
+
+        merged.push({
+            start: -1,
+            end: -1,
+            text: '',
+            exampleText: block.text,
+            markerPair: block.markerPair,
+            markerName: block.label,
+            label: block.label,
+            blockKind: block.blockKind,
+            source: '缺失',
+            preview: `当前回复缺少此块；将按聊天基准第 ${baselineIndex + 1} 个位置补回。`,
+            isMissing: true,
+            baselineIndex,
+            displayOrder: baselineIndex,
+            signature: block.signature,
+            occurrence: block.occurrence,
+            identityKey: block.identityKey,
+            baselineSourceMessageId: baseline.sourceMessageId,
+            baselinePosition: block.position,
+            insertAt: resolveMissingBlockInsertIndex(currentText, { baselineIndex }, merged),
+        });
+    }
+
+    return merged
+        .sort((a, b) => a.displayOrder - b.displayOrder || a.start - b.start)
+        .map((block, index) => ({
+            ...block,
+            index,
+        }));
+}
+
+function collectRecognizedBlocks(text, settings = getSettings(), templateText = '', options = {}) {
+    const source = String(text || '');
+    const actualBlocks = collectActualRecognizedBlocks(source, settings, templateText);
+    if (options.includeMissing === false) {
+        return actualBlocks;
+    }
+
+    const baseline = getChatBlockBaseline(settings, templateText, Number(options.messageId ?? runtime.active?.messageId ?? -1));
+    return mergeRecognizedBlocksWithBaseline(actualBlocks, baseline, source);
+}
+
 function inferMarkerPairFromBlockText(text) {
     const source = String(text || '').trim();
     if (!source) {
         return null;
+    }
+
+    const fenceMatch = source.match(/^([ \t]{0,3})(`{3,}|~{3,})([^\r\n]*)/u);
+    if (fenceMatch) {
+        const closeFence = `${fenceMatch[1]}${fenceMatch[2]}`;
+        const closeRegex = new RegExp(`(?:^|\\n)${escapeRegExp(closeFence)}[ \\t]*$`, 'u');
+        if (closeRegex.test(source)) {
+            return [`${fenceMatch[1]}${fenceMatch[2]}${fenceMatch[3] || ''}`, closeFence];
+        }
     }
 
     const bracketPair = makeBracketMarkerPair(source.match(/^(\[[^\]\r\n]{1,80}\]|【[^】\r\n]{1,80}】|「[^」\r\n]{1,80}」)/u)?.[1] || '');
@@ -952,7 +1760,11 @@ function getSelectedRecognizedBlocks() {
     return getSelectedBlockIndexes()
         .map(index => runtime.recognizedBlocks[index] ? { ...runtime.recognizedBlocks[index], selectedIndex: index } : null)
         .filter(Boolean)
-        .sort((a, b) => a.start - b.start || a.end - b.end);
+        .sort((a, b) => {
+            const aOrder = Number.isInteger(a.displayOrder) ? a.displayOrder : a.selectedIndex;
+            const bOrder = Number.isInteger(b.displayOrder) ? b.displayOrder : b.selectedIndex;
+            return aOrder - bOrder || a.start - b.start || a.end - b.end;
+        });
 }
 
 function getRecognizedBlockSelectionKey(block) {
@@ -960,7 +1772,15 @@ function getRecognizedBlockSelectionKey(block) {
         return '';
     }
 
+    if (block.identityKey) {
+        return `${block.isMissing ? 'missing' : 'actual'}:${block.identityKey}`;
+    }
+
     return `${block.start}:${block.end}:${block.text}`;
+}
+
+function getBlockEvidenceText(block) {
+    return String(block?.isMissing ? block.exampleText || block.text || '' : block?.text || '');
 }
 
 function selectedLooksLikeStatusBlock(selectedText, settings = getSettings()) {
@@ -1190,20 +2010,90 @@ function findTailBlockCandidate(text, blockKind = 'auto', settings = getSettings
     };
 }
 
-function getSelectedTextInMessage(messageElement) {
+function getSelectionInfoInMessage(messageElement) {
     const selection = window.getSelection?.();
     const textElement = messageElement?.querySelector('.mes_text');
     if (!selection || !textElement || selection.rangeCount === 0 || selection.isCollapsed) {
-        return '';
+        return null;
     }
 
     const anchorInside = selection.anchorNode && textElement.contains(selection.anchorNode);
     const focusInside = selection.focusNode && textElement.contains(selection.focusNode);
     if (!anchorInside || !focusInside) {
-        return '';
+        return null;
     }
 
-    return normalizeLineBreaks(selection.toString()).trim();
+    const selectedText = normalizeLineBreaks(selection.toString()).trim();
+    if (!selectedText) {
+        return null;
+    }
+
+    const messageId = getMessageIdFromElement(messageElement);
+    const currentText = getMessageText(messageId);
+    const range = selection.getRangeAt(0).cloneRange();
+    let normalizedStart = -1;
+    try {
+        const beforeRange = range.cloneRange();
+        beforeRange.selectNodeContents(textElement);
+        beforeRange.setEnd(range.startContainer, range.startOffset);
+        normalizedStart = normalizeSearchTextWithMap(beforeRange.toString()).text.length;
+    } catch {
+        normalizedStart = -1;
+    }
+
+    const rawRange = locateRawSelectionRange(currentText, selectedText, { normalizedStart });
+    return {
+        messageId,
+        messageElement,
+        selectedText,
+        selectedRawText: rawRange?.text || '',
+        rawStart: rawRange?.start ?? -1,
+        rawEnd: rawRange?.end ?? -1,
+        normalizedStart,
+        capturedAt: Date.now(),
+    };
+}
+
+function rememberSelectionInfo(info) {
+    if (info?.selectedText && Number.isInteger(info.messageId)) {
+        runtime.selectionSnapshot = {
+            messageId: info.messageId,
+            selectedText: info.selectedText,
+            selectedRawText: info.selectedRawText || '',
+            rawStart: info.rawStart ?? -1,
+            rawEnd: info.rawEnd ?? -1,
+            normalizedStart: info.normalizedStart ?? -1,
+            capturedAt: Date.now(),
+        };
+    }
+
+    return info;
+}
+
+function getSelectedTextInMessage(messageElement) {
+    return getSelectionInfoInMessage(messageElement)?.selectedText || '';
+}
+
+function getFreshSelectionSnapshot() {
+    const snapshot = runtime.selectionSnapshot;
+    if (!snapshot || !snapshot.selectedText) {
+        return null;
+    }
+
+    if (Date.now() - Number(snapshot.capturedAt || 0) > 30000) {
+        return null;
+    }
+
+    return snapshot;
+}
+
+function getSelectionSnapshotForMessage(messageId) {
+    const snapshot = getFreshSelectionSnapshot();
+    if (!snapshot || snapshot.messageId !== messageId) {
+        return null;
+    }
+
+    return snapshot;
 }
 
 function getElementFromNode(node) {
@@ -1230,11 +2120,27 @@ function getSelectedMessageElement() {
     }
 
     const messageId = getMessageIdFromElement(anchorMessage);
-    if (!getCurrentMessage(messageId) || !getSelectedTextInMessage(anchorMessage)) {
+    const selectionInfo = getSelectionInfoInMessage(anchorMessage);
+    if (!getCurrentMessage(messageId) || !selectionInfo) {
         return null;
     }
 
+    rememberSelectionInfo(selectionInfo);
     return anchorMessage;
+}
+
+function captureCurrentSelectionSnapshot() {
+    const messageElement = getSelectedMessageElement();
+    if (!messageElement) {
+        return null;
+    }
+
+    const messageId = getMessageIdFromElement(messageElement);
+    if (messageId === -1) {
+        return null;
+    }
+
+    return { messageElement, messageId };
 }
 
 function buildRecentContext(messageId, settings = getSettings()) {
@@ -1292,17 +2198,19 @@ function findPreviousBlockExamples(messageId, blockKind = 'auto', settings = get
     return examples;
 }
 
-function getSelectionParts(messageId, selectedText) {
+function getSelectionParts(messageId, selectedText, selectionRange = null) {
     const currentText = getMessageText(messageId);
-    const index = selectedText ? currentText.indexOf(selectedText) : -1;
-    if (index === -1) {
+    const range = locateRawSelectionRange(currentText, selectedText, selectionRange || {});
+    if (!range) {
         return null;
     }
 
     return {
-        before: currentText.slice(0, index),
-        selected: selectedText,
-        after: currentText.slice(index + selectedText.length),
+        before: currentText.slice(0, range.start),
+        selected: range.text,
+        selectedVisible: selectedText,
+        after: currentText.slice(range.end),
+        range,
     };
 }
 
@@ -1492,10 +2400,17 @@ function buildContinuePrompt(active, instruction, sourceText) {
 
 function buildRewritePrompt(active, instruction, sourceText) {
     const settings = getSettings();
-    const parts = getSelectionParts(active.messageId, active.selectedText);
+    const parts = getSelectionParts(active.messageId, active.selectedText, active.selectionRange);
     if (!parts) {
         throw new Error('原选区已经不在当前回复里，不能安全重写。');
     }
+
+    active.selectionRange = {
+        rawStart: parts.range.start,
+        rawEnd: parts.range.end,
+        selectedRawText: parts.range.text,
+        normalizedStart: active.selectionRange?.normalizedStart ?? -1,
+    };
 
     return [
         '你正在局部重写一条已经生成过的角色扮演回复。',
@@ -1514,7 +2429,7 @@ function buildRewritePrompt(active, instruction, sourceText) {
         trimText(parts.before, Math.floor(settings.contextLength / 2), true),
         '',
         '需要重写的选中片段：',
-        sourceText || parts.selected,
+        sourceText || parts.selectedVisible || parts.selected,
         '',
         '后文：',
         trimText(parts.after, Math.floor(settings.contextLength / 2), false),
@@ -1923,7 +2838,8 @@ function prepareStatusEvidence(active, instruction, sourceText) {
     const currentText = getMessageText(active.messageId);
     const parsed = findStatusBlocks(currentText, settings);
     const selectedText = active.selectedText || '';
-    const selectedInCurrent = selectedLooksLikeStatusBlock(selectedText, settings) && currentText.includes(selectedText);
+    const selectedRange = selectedText ? locateRawSelectionRange(currentText, selectedText, active.selectionRange || {}) : null;
+    const selectedInCurrent = selectedLooksLikeStatusBlock(selectedText, settings) && Boolean(selectedRange);
     const manualEvidenceRaw = String(sourceText || '');
     const manualEvidence = manualEvidenceRaw.trim();
     const manualTarget = findManualEvidenceTarget(currentText, manualEvidenceRaw);
@@ -1933,19 +2849,27 @@ function prepareStatusEvidence(active, instruction, sourceText) {
     let targetBlock = '';
     let applyTarget = '';
     let applyMode = '';
+    let applyStart = -1;
+    let applyEnd = -1;
 
     if (selectedInCurrent) {
         targetBlock = manualEvidence || selectedText;
         applyTarget = selectedText;
         applyMode = 'replace_selection';
+        applyStart = selectedRange.start;
+        applyEnd = selectedRange.end;
     } else if (manualTarget) {
         targetBlock = manualEvidence || manualTarget.text;
         applyTarget = manualTarget.text;
         applyMode = 'replace_manual';
+        applyStart = manualTarget.start;
+        applyEnd = manualTarget.end;
     } else if (parsed.blocks.length === 1) {
         targetBlock = manualEvidence || parsed.blocks[0].text;
         applyTarget = parsed.blocks[0].text;
         applyMode = 'replace_block';
+        applyStart = parsed.blocks[0].start;
+        applyEnd = parsed.blocks[0].end;
     } else if (parsed.blocks.length > 1) {
         throw new Error('当前回复有多个完整状态栏。请用“抓取最后完整块”或“抓取消息尾部”把目标放进证据框。');
     } else {
@@ -1973,6 +2897,8 @@ function prepareStatusEvidence(active, instruction, sourceText) {
         targetBlock,
         applyTarget,
         applyMode,
+        applyStart,
+        applyEnd,
         previousExamples,
         template,
         instruction,
@@ -2031,39 +2957,69 @@ function prepareBlockEvidence(active, instruction, sourceText) {
     const template = getCurrentTemplateEvidenceText();
     const parsed = findStructureBlocks(currentText, selectedBlockKind, settings, template);
     const selectedText = active.selectedText || '';
-    const selectedInCurrent = selectedLooksLikeStructureBlock(selectedText, selectedBlockKind, settings, template) && currentText.includes(selectedText);
+    const selectedRange = selectedText ? locateRawSelectionRange(currentText, selectedText, active.selectionRange || {}) : null;
+    const selectedInCurrent = selectedLooksLikeStructureBlock(selectedText, selectedBlockKind, settings, template) && Boolean(selectedRange);
     const manualEvidenceRaw = String(sourceText || '');
     const manualEvidence = manualEvidenceRaw.trim();
     const manualTarget = findManualEvidenceTarget(currentText, manualEvidenceRaw);
-    const previousExamples = findPreviousBlockExamples(active.messageId, selectedBlockKind, settings, template);
+    let previousExamples = findPreviousBlockExamples(active.messageId, selectedBlockKind, settings, template);
 
     let targetBlock = '';
     let applyTarget = '';
     let applyMode = '';
     let applyStart = -1;
     let applyEnd = -1;
+    let markerPairHint = null;
+    let missingHint = null;
     const selectedRecognizedBlocks = getSelectedRecognizedBlocks();
     const selectedRecognizedBlock = selectedRecognizedBlocks.length === 1 ? selectedRecognizedBlocks[0] : null;
 
-    if (selectedRecognizedBlock) {
+    if (selectedRecognizedBlock?.isMissing) {
+        const exampleText = getBlockEvidenceText(selectedRecognizedBlock);
+        targetBlock = manualEvidence || exampleText;
+        applyTarget = '';
+        applyMode = 'insert_missing';
+        applyStart = Number.isInteger(selectedRecognizedBlock.insertAt) ? selectedRecognizedBlock.insertAt : -1;
+        applyEnd = applyStart;
+        markerPairHint = selectedRecognizedBlock.markerPair;
+        missingHint = {
+            isMissing: true,
+            baselineIndex: selectedRecognizedBlock.baselineIndex,
+            identityKey: selectedRecognizedBlock.identityKey,
+            exampleText,
+            insertAt: selectedRecognizedBlock.insertAt,
+            label: selectedRecognizedBlock.label,
+        };
+        if (exampleText.trim() && !previousExamples.some(example => example.trim() === exampleText.trim())) {
+            previousExamples = [exampleText, ...previousExamples];
+        }
+    } else if (selectedRecognizedBlock) {
         const range = resolveCurrentBlockRange(currentText, selectedRecognizedBlock, selectedRecognizedBlock.label || '结构块');
         targetBlock = manualEvidence || selectedRecognizedBlock.text;
         applyTarget = selectedRecognizedBlock.text;
         applyMode = 'replace_recognized';
         applyStart = range.start;
         applyEnd = range.end;
+        markerPairHint = selectedRecognizedBlock.markerPair;
     } else if (selectedInCurrent) {
         targetBlock = manualEvidence || selectedText;
         applyTarget = selectedText;
         applyMode = 'replace_selection';
+        applyStart = selectedRange.start;
+        applyEnd = selectedRange.end;
     } else if (manualTarget) {
         targetBlock = manualEvidence || manualTarget.text;
         applyTarget = manualTarget.text;
         applyMode = 'replace_manual';
+        applyStart = manualTarget.start;
+        applyEnd = manualTarget.end;
     } else if (parsed.blocks.length === 1) {
         targetBlock = manualEvidence || parsed.blocks[0].text;
         applyTarget = parsed.blocks[0].text;
         applyMode = 'replace_block';
+        applyStart = parsed.blocks[0].start;
+        applyEnd = parsed.blocks[0].end;
+        markerPairHint = parsed.blocks[0].markerPair;
     } else if (parsed.blocks.length > 1) {
         throw new Error('当前回复有多个可能的结构块。请先在左侧识别块列表里点你要修的那一块。');
     } else {
@@ -2090,7 +3046,8 @@ function prepareBlockEvidence(active, instruction, sourceText) {
         instruction,
         blockKind: inferredKind,
         selectedBlockKind,
-        markerPair,
+        markerPair: markerPairHint || markerPair,
+        ...missingHint,
     };
 }
 
@@ -2105,26 +3062,45 @@ function prepareMultiBlockEvidence(active, instruction) {
     }
 
     const targets = selectedBlocks.map((block, index) => {
+        const isMissing = Boolean(block.isMissing);
+        const evidenceText = getBlockEvidenceText(block);
         const blockKind = isKnownBlockKind(block.blockKind) && block.blockKind !== 'auto'
             ? block.blockKind
-            : inferBlockKindFromText([block.label, block.text, template].join('\n'));
-        const range = resolveCurrentBlockRange(currentText, block, block.label || getBlockTypeLabel(blockKind));
+            : inferBlockKindFromText([block.label, evidenceText, template].join('\n'));
+        const range = isMissing
+            ? { start: -1, end: -1 }
+            : resolveCurrentBlockRange(currentText, block, block.label || getBlockTypeLabel(blockKind));
         const ordinal = index + 1;
 
         return {
             ordinal,
             selectedIndex: block.selectedIndex,
             label: block.label || getBlockTypeLabel(blockKind),
-            source: block.source || '结构块',
-            text: block.text,
+            source: isMissing ? '缺失' : block.source || '结构块',
+            text: evidenceText,
             start: range.start,
             end: range.end,
+            missing: isMissing,
+            baselineIndex: block.baselineIndex,
+            identityKey: block.identityKey,
+            insertAt: block.insertAt,
             blockKind,
-            markerPair: chooseBlockMarkerPair(blockKind, block.text, template, settings),
+            markerPair: block.markerPair || chooseBlockMarkerPair(blockKind, evidenceText, template, settings),
             startMarker: makeMultiBlockStartMarker(ordinal),
             endMarker: makeMultiBlockEndMarker(ordinal),
         };
     });
+
+    const orderedTargets = targets
+        .filter(target => !target.missing)
+        .sort((a, b) => a.start - b.start || b.end - a.end);
+    for (let index = 1; index < orderedTargets.length; index += 1) {
+        const previous = orderedTargets[index - 1];
+        const current = orderedTargets[index];
+        if (current.start < previous.end) {
+            throw new Error('选中的块互相重叠或存在包含关系。请只选最外层那一块，或选择彼此独立的块。');
+        }
+    }
 
     const previousExamples = [];
     const seenExamples = new Set();
@@ -2170,6 +3146,10 @@ function removeKnownBlocks(text, evidence) {
     const targets = [...(evidence?.targets || [])].sort((a, b) => b.start - a.start);
 
     for (const target of targets) {
+        if (target.missing) {
+            continue;
+        }
+
         const placeholder = `[第${target.ordinal}个${target.label}位置]`;
         if (result.slice(target.start, target.end) === target.text) {
             result = `${result.slice(0, target.start)}${placeholder}${result.slice(target.end)}`;
@@ -2253,22 +3233,28 @@ function buildBlockPrompt(active, instruction, sourceText) {
     const evidence = prepareBlockEvidence(active, instruction, sourceText);
     const contextText = removeKnownBlock(getMessageText(active.messageId), evidence);
     const label = getBlockTypeLabel(evidence.blockKind);
+    const isMissingInsert = evidence.applyMode === 'insert_missing';
+    const targetLabel = evidence.label || label;
 
     runtime.active.blockEvidence = evidence;
 
     return [
-        `你正在修复或按证据更新一段${label}。`,
+        isMissingInsert
+            ? `当前回复缺失一段${targetLabel}，你需要按本聊天记录的基准格式补回这一块。`
+            : `你正在修复或按证据更新一段${label}。`,
         '硬性规则：',
         '1. 只输出这个结构块本体，不要解释，不要标题，不要代码围栏。',
         '2. “预设/正则/世界书格式证据”只用于确认外层标签、HTML/class、字段顺序、按钮宏和排版格式，不能当成当前剧情事实。',
         '3. “旧结构块/当前回复/最近上下文”才是字段值和状态变化的事实依据。',
-        '4. 不要新增模板中不存在的字段，不要改变字段顺序。',
-        '5. 无法从证据确定的字段，保持旧值；如果没有旧值，写“未知”或“无”。',
-        '6. 不要编造地点、时间、人物状态、数值、装备、关系变化、身体变化或剧情进展。',
-        '7. 模板里的 {{divlist}}、{{button}} 等宏必须按原样输出，不要解释成文字。',
-        ...getBlockSpecificRules(evidence.blockKind).map((rule, index) => `${index + 8}. ${rule}`),
+        '4. 如果旧结构块标签缺失、HTML/括号未闭合或渲染破碎，必须按旧字段、旧样式和格式证据重建一个完整可渲染的块，不要原样复读坏掉的源码。',
+        '5. 不要新增模板中不存在的字段，不要改变字段顺序。',
+        '6. 无法从证据确定的字段，保持旧值；如果没有旧值，写“未知”或“无”。',
+        '7. 不要编造地点、时间、人物状态、数值、装备、关系变化、身体变化或剧情进展。',
+        '8. 模板里的 {{divlist}}、{{button}} 等宏必须按原样输出，不要解释成文字。',
+        ...(isMissingInsert ? ['9. 当前目标块在本回复中缺失；聊天基准样例只能当格式和旧字段参考，字段值必须来自当前回复正文、最近上下文和用户额外要求。'] : []),
+        ...getBlockSpecificRules(evidence.blockKind).map((rule, index) => `${index + (isMissingInsert ? 10 : 9)}. ${rule}`),
         '',
-        `块类型：${label}`,
+        `块类型：${targetLabel}`,
         `用户额外要求：${instruction || '无'}`,
         '',
         '预设/正则/世界书格式证据（只当格式，不当事实）：',
@@ -2277,7 +3263,7 @@ function buildBlockPrompt(active, instruction, sourceText) {
         '历史正常结构块样例（优先当格式参考，不能凭空复制旧数值）：',
         evidence.previousExamples.length ? evidence.previousExamples.join('\n\n---\n\n') : '无',
         '',
-        '旧结构块或坏掉的结构块证据：',
+        isMissingInsert ? '聊天基准样例（当前回复缺失此块，只当格式和旧字段参考）：' : '旧结构块或坏掉的结构块证据：',
         evidence.targetBlock || '无',
         '',
         '最近上下文：',
@@ -2296,10 +3282,11 @@ function buildMultiBlockPrompt(active, instruction) {
         .map(target => [
             `第 ${target.ordinal} 个块：${target.label}`,
             `来源：${target.source}`,
+            `当前状态：${target.missing ? '缺失，将按聊天基准顺序补回' : '当前回复中存在，将替换原块'}`,
             `块类型：${getBlockTypeLabel(target.blockKind)}`,
             `输出开始标记：${target.startMarker}`,
             `输出结束标记：${target.endMarker}`,
-            '旧结构块或坏掉的结构块证据：',
+            target.missing ? '聊天基准样例（当前回复缺失此块，只当格式和旧字段参考）：' : '旧结构块或坏掉的结构块证据：',
             target.text,
         ].join('\n'))
         .join('\n\n---\n\n');
@@ -2318,11 +3305,13 @@ function buildMultiBlockPrompt(active, instruction) {
         '2. 每个输出标记之间只能放对应结构块本体，不要解释，不要标题，不要代码围栏，不要合并多个块。',
         '3. “预设/正则/世界书格式证据”只用于确认外层标签、HTML/class、字段顺序、按钮宏和排版格式，不能当成当前剧情事实。',
         '4. “旧结构块/当前回复/最近上下文”才是字段值和状态变化的事实依据。',
-        '5. 不要新增模板中不存在的字段，不要改变字段顺序。',
-        '6. 无法从证据确定的字段，保持旧值；如果没有旧值，写“未知”或“无”。',
-        '7. 不要编造地点、时间、人物状态、数值、装备、关系变化、身体变化或剧情进展。',
-        '8. 模板里的 {{divlist}}、{{button}} 等宏必须按原样输出，不要解释成文字。',
-        ...specificRules.map((rule, index) => `${index + 9}. ${rule}`),
+        '5. 如果旧结构块标签缺失、HTML/括号未闭合或渲染破碎，必须按旧字段、旧样式和格式证据重建完整可渲染的块，不要原样复读坏掉的源码。',
+        '6. 不要新增模板中不存在的字段，不要改变字段顺序。',
+        '7. 无法从证据确定的字段，保持旧值；如果没有旧值，写“未知”或“无”。',
+        '8. 不要编造地点、时间、人物状态、数值、装备、关系变化、身体变化或剧情进展。',
+        '9. 模板里的 {{divlist}}、{{button}} 等宏必须按原样输出，不要解释成文字。',
+        ...(evidence.targets.some(target => target.missing) ? ['10. 对缺失块，聊天基准样例只能当格式和旧字段参考，字段值必须来自当前回复正文、最近上下文和用户额外要求。'] : []),
+        ...specificRules.map((rule, index) => `${index + (evidence.targets.some(target => target.missing) ? 11 : 10)}. ${rule}`),
         '',
         `用户额外要求：${instruction || '无'}`,
         '',
@@ -2516,19 +3505,28 @@ function buildRepairedMessageText(active, replacementText) {
         case 'continue_tail':
             return `${currentText}${currentText.endsWith('\n') || replacementText.startsWith('\n') ? '' : '\n'}${replacementText}`;
         case 'rewrite_selection': {
-            if (!active.selectedText || !currentText.includes(active.selectedText)) {
+            const range = locateRawSelectionRange(currentText, active.selectedText, active.selectionRange || {});
+            if (!range) {
                 throw new Error('原选区已经不在当前回复里，不能安全替换。');
             }
 
-            return currentText.replace(active.selectedText, replacementText);
+            active.selectionRange = {
+                rawStart: range.start,
+                rawEnd: range.end,
+                selectedRawText: range.text,
+                normalizedStart: active.selectionRange?.normalizedStart ?? -1,
+            };
+
+            return `${currentText.slice(0, range.start)}${replacementText}${currentText.slice(range.end)}`;
         }
         case 'repair_format': {
             if (active.selectedText) {
-                if (!currentText.includes(active.selectedText)) {
+                const range = locateRawSelectionRange(currentText, active.selectedText, active.selectionRange || {});
+                if (!range) {
                     throw new Error('原选区已经不在当前回复里，不能安全替换。');
                 }
 
-                return currentText.replace(active.selectedText, replacementText);
+                return `${currentText.slice(0, range.start)}${replacementText}${currentText.slice(range.end)}`;
             }
 
             return replacementText;
@@ -2536,21 +3534,13 @@ function buildRepairedMessageText(active, replacementText) {
         case 'repair_statebar': {
             const evidence = active.statusEvidence || prepareStatusEvidence(active, '', document.getElementById('rr-source')?.value || '');
 
-            if (evidence.applyMode === 'replace_selection' || evidence.applyMode === 'replace_manual') {
-                if (!evidence.applyTarget || !currentText.includes(evidence.applyTarget)) {
-                    throw new Error('状态栏目标片段已经不在当前回复里，不能安全替换。');
-                }
-
-                return currentText.replace(evidence.applyTarget, replacementText);
-            }
-
-            if (evidence.applyMode === 'replace_block') {
-                const parsed = findStatusBlocks(currentText);
-                if (parsed.blocks.length !== 1) {
-                    throw new Error('当前状态栏数量已经变化，不能安全替换。');
-                }
-
-                return `${currentText.slice(0, parsed.blocks[0].start)}${replacementText}${currentText.slice(parsed.blocks[0].end)}`;
+            if (evidence.applyMode === 'replace_selection' || evidence.applyMode === 'replace_manual' || evidence.applyMode === 'replace_block') {
+                const range = resolveCurrentBlockRange(currentText, {
+                    text: evidence.applyTarget,
+                    start: evidence.applyStart,
+                    end: evidence.applyEnd,
+                }, '状态栏');
+                return `${currentText.slice(0, range.start)}${replacementText}${currentText.slice(range.end)}`;
             }
 
             if (evidence.applyMode === 'append_new') {
@@ -2576,12 +3566,29 @@ function buildRepairedMessageText(active, replacementText) {
                     : parseMultiBlockPreview(String(replacementText || ''), evidence);
                 let result = currentText;
 
-                for (const { target, text } of [...payload.replacements].sort((a, b) => b.target.start - a.target.start)) {
+                const existingReplacements = payload.replacements.filter(({ target }) => !target.missing);
+                const missingReplacements = payload.replacements.filter(({ target }) => target.missing);
+
+                for (const { target, text } of [...existingReplacements].sort((a, b) => b.target.start - a.target.start)) {
                     const range = resolveCurrentBlockRange(result, target, target.label || '结构块');
                     result = `${result.slice(0, range.start)}${text}${result.slice(range.end)}`;
                 }
 
+                for (const { target, text } of [...missingReplacements].sort((a, b) => {
+                    const aOrder = Number.isInteger(a.target.baselineIndex) ? a.target.baselineIndex : Number.MAX_SAFE_INTEGER;
+                    const bOrder = Number.isInteger(b.target.baselineIndex) ? b.target.baselineIndex : Number.MAX_SAFE_INTEGER;
+                    return aOrder - bOrder || a.target.ordinal - b.target.ordinal;
+                })) {
+                    const insertAt = resolveMissingBlockInsertIndexInText(result, target, evidence);
+                    result = insertBlockAtPosition(result, text, insertAt);
+                }
+
                 return result;
+            }
+
+            if (evidence.applyMode === 'insert_missing') {
+                const insertAt = resolveMissingBlockInsertIndexInText(currentText, evidence, evidence);
+                return insertBlockAtPosition(currentText, replacementText, insertAt);
             }
 
             if (evidence.applyMode === 'replace_recognized') {
@@ -2594,11 +3601,12 @@ function buildRepairedMessageText(active, replacementText) {
             }
 
             if (evidence.applyMode === 'replace_selection' || evidence.applyMode === 'replace_manual' || evidence.applyMode === 'replace_block') {
-                if (!evidence.applyTarget || !currentText.includes(evidence.applyTarget)) {
-                    throw new Error('结构块目标片段已经不在当前回复里，不能安全替换。');
-                }
-
-                return currentText.replace(evidence.applyTarget, replacementText);
+                const range = resolveCurrentBlockRange(currentText, {
+                    text: evidence.applyTarget,
+                    start: evidence.applyStart,
+                    end: evidence.applyEnd,
+                }, getBlockTypeLabel(evidence.blockKind));
+                return `${currentText.slice(0, range.start)}${replacementText}${currentText.slice(range.end)}`;
             }
 
             if (evidence.applyMode === 'append_new') {
@@ -2622,18 +3630,23 @@ async function writeMessageText(messageId, nextText) {
         throw new Error('目标助手消息不存在。');
     }
 
-    message.mes = nextText;
+    const text = String(nextText ?? '');
+    message.mes = text;
 
-    if (message.extra && typeof message.extra === 'object') {
-        delete message.extra.display_text;
+    if (!message.extra || typeof message.extra !== 'object') {
+        message.extra = {};
     }
+    delete message.extra.display_text;
 
     if (message.swipe_id !== undefined || Array.isArray(message.swipes)) {
         ensureSwipes(message);
-        message.swipes[message.swipe_id] = nextText;
+        const swipeId = Number.isInteger(message.swipe_id) && message.swipe_id >= 0 ? message.swipe_id : 0;
+        message.swipe_id = swipeId;
+        message.swipes[swipeId] = text;
     }
 
-    updateMessageBlock(messageId, message);
+    chat_metadata.tainted = true;
+    updateMessageBlock(messageId, message, { rerenderMessage: true });
     await eventSource.emit(event_types.MESSAGE_UPDATED, messageId);
     await saveChatConditional();
     scheduleButtonRefresh();
@@ -2673,9 +3686,16 @@ async function generatePreview() {
         }
 
         preview.value = clean;
-        status.textContent = runtime.active.blockEvidence?.applyMode === 'replace_multiple_blocks'
-            ? `已生成 ${runtime.active.blockEvidence.targets.length} 个块的预览。确认无误后会分别替换这些原始块。`
-            : '已生成预览。确认无误后再应用到当前回复。';
+        if (runtime.active.blockEvidence?.applyMode === 'replace_multiple_blocks') {
+            const missingCount = runtime.active.blockEvidence.targets.filter(target => target.missing).length;
+            status.textContent = missingCount
+                ? `已生成 ${runtime.active.blockEvidence.targets.length} 个块的预览，其中 ${missingCount} 个缺失块会按聊天基准顺序插回。`
+                : `已生成 ${runtime.active.blockEvidence.targets.length} 个块的预览。确认无误后会分别替换这些原始块。`;
+        } else if (runtime.active.blockEvidence?.applyMode === 'insert_missing') {
+            status.textContent = '已生成缺失块预览。确认无误后会按聊天基准顺序插回当前回复。';
+        } else {
+            status.textContent = '已生成预览。确认无误后再应用到当前回复。';
+        }
     } catch (error) {
         const message = error?.message || String(error);
         status.textContent = message;
@@ -2713,6 +3733,9 @@ async function applyPreview() {
         runtime.undoStack = runtime.undoStack.slice(-MAX_UNDO_RECORDS);
 
         await writeMessageText(runtime.active.messageId, after);
+        if (runtime.active?.mode === 'repair_block') {
+            renderRecognizedBlocks(runtime.selectedBlockIndex);
+        }
         document.getElementById('rr-modal-status').textContent = '已应用到当前回复，可用“撤销上次急救”恢复。';
         notify('success', '已应用急救结果。');
     } catch (error) {
@@ -2936,11 +3959,14 @@ function setBlockSource(kind) {
 
 function formatSelectedBlocksSource(blocks) {
     if (blocks.length === 1) {
-        return blocks[0].text;
+        return getBlockEvidenceText(blocks[0]);
     }
 
     return blocks
-        .map(block => `【${block.selectedIndex + 1}. ${block.label}】\n${block.text}`)
+        .map(block => {
+            const status = block.isMissing ? '缺失，显示聊天基准样例' : '当前回复原文';
+            return `【${block.selectedIndex + 1}. ${block.label}｜${status}】\n${getBlockEvidenceText(block)}`;
+        })
         .join('\n\n--- 回复救急分隔 ---\n\n');
 }
 
@@ -2992,18 +4018,22 @@ function updateSelectedRecognizedBlocks({ refreshTemplates = false } = {}) {
 
     if (blocks.length === 1) {
         const block = blocks[0];
+        const isMissing = Boolean(block.isMissing);
         runtime.selectedBlockIndex = block.selectedIndex;
         runtime.active.selectedBlockKind = isKnownBlockKind(block.blockKind) ? block.blockKind : 'custom';
         if (sourceElement) {
-            sourceElement.value = block.text;
+            sourceElement.value = getBlockEvidenceText(block);
         }
         if (titleElement) {
-            titleElement.textContent = `${block.label} 原文`;
+            titleElement.textContent = isMissing ? `${block.label} 缺失样例` : `${block.label} 原文`;
         }
         if (warningElement) {
-            warningElement.textContent = `已选中第 ${block.selectedIndex + 1} 个块：${block.label}。应用时只替换这段原始消息文本。`;
+            warningElement.textContent = isMissing
+                ? `当前回复缺失第 ${block.selectedIndex + 1} 个块：${block.label}。这里显示的是聊天基准样例；应用时会按基准顺序插入到对应位置。`
+                : `已选中第 ${block.selectedIndex + 1} 个块：${block.label}。应用时只替换这段原始消息文本。`;
         }
     } else {
+        const missingCount = blocks.filter(block => block.isMissing).length;
         runtime.selectedBlockIndex = blocks[0].selectedIndex;
         runtime.active.selectedBlockKind = 'auto';
         if (sourceElement) {
@@ -3013,7 +4043,9 @@ function updateSelectedRecognizedBlocks({ refreshTemplates = false } = {}) {
             titleElement.textContent = `已选 ${blocks.length} 个块`;
         }
         if (warningElement) {
-            warningElement.textContent = `已选择 ${blocks.length} 个块；生成预览会按同一条要求分别修复，应用时只替换这些原始消息文本。`;
+            warningElement.textContent = missingCount
+                ? `已选择 ${blocks.length} 个块，其中 ${missingCount} 个当前缺失；生成预览会分别修复，应用时会替换已有块并把缺失块插回基准位置。`
+                : `已选择 ${blocks.length} 个块；生成预览会按同一条要求分别修复，应用时只替换这些原始消息文本。`;
         }
     }
 
@@ -3081,10 +4113,12 @@ function renderRecognizedBlocks(preferredIndex = 0, { refreshTemplates = false }
     runtime.recognizedBlocks.forEach((block, index) => {
         const button = document.createElement('button');
         button.type = 'button';
-        button.className = 'rr-block-item';
+        button.className = `rr-block-item${block.isMissing ? ' missing' : ''}`;
         button.dataset.index = String(index);
         button.setAttribute('aria-pressed', 'false');
-        button.title = '点击选择或取消，可多选后一次修复';
+        button.title = block.isMissing
+            ? '当前回复缺失此块；点击后可按聊天基准补回'
+            : '点击选择或取消，可多选后一次修复';
         button.innerHTML = `
             <span class="rr-block-item-top">
                 <span class="rr-block-title-line">
@@ -3183,7 +4217,9 @@ function openRescueModal(messageId, messageElement) {
         return;
     }
 
-    const selectedText = getSelectedTextInMessage(messageElement);
+    const selectionInfo = rememberSelectionInfo(getSelectionInfoInMessage(messageElement))
+        || getSelectionSnapshotForMessage(messageId);
+    const selectedText = selectionInfo?.selectedText || '';
     if (!selectedText) {
         notify('warning', '请先选中要修改的正文片段；结构块请从底部魔法棒菜单打开“回复救急插件”。');
         return;
@@ -3194,6 +4230,12 @@ function openRescueModal(messageId, messageElement) {
     runtime.active = {
         messageId,
         selectedText,
+        selectionRange: {
+            rawStart: selectionInfo.rawStart ?? -1,
+            rawEnd: selectionInfo.rawEnd ?? -1,
+            selectedRawText: selectionInfo.selectedRawText || '',
+            normalizedStart: selectionInfo.normalizedStart ?? -1,
+        },
         mode: initialMode,
         statusEvidence: null,
         blockEvidence: null,
@@ -3356,6 +4398,12 @@ function createRescueButton(messageId, variant) {
     button.className = `mes_button rr_rescue_button rr_rescue_button_${variant} fa-solid fa-wand-magic-sparkles`;
     button.title = '回复救急';
     button.dataset.messageId = String(messageId);
+    const preserveSelection = () => {
+        captureCurrentSelectionSnapshot();
+    };
+    button.addEventListener('pointerdown', preserveSelection);
+    button.addEventListener('mousedown', preserveSelection);
+    button.addEventListener('touchstart', preserveSelection, { passive: true });
     return button;
 }
 
@@ -3418,14 +4466,35 @@ function mountSelectionButton() {
     button.className = 'rr-selection-button fa-solid fa-wand-magic-sparkles';
     button.title = '回复救急';
     button.hidden = true;
-    button.addEventListener('mousedown', (event) => {
+
+    const preserveSelectionBeforeButtonAction = (event) => {
+        captureCurrentSelectionSnapshot();
         event.preventDefault();
-    });
+        event.stopPropagation();
+    };
+
+    button.addEventListener('pointerdown', preserveSelectionBeforeButtonAction);
+    button.addEventListener('mousedown', preserveSelectionBeforeButtonAction);
+    button.addEventListener('touchstart', preserveSelectionBeforeButtonAction, { passive: false });
     button.addEventListener('click', (event) => {
         event.preventDefault();
         event.stopPropagation();
-        const messageElement = getSelectedMessageElement();
-        const messageId = getMessageIdFromElement(messageElement);
+        let messageElement = getSelectedMessageElement();
+        let messageId = getMessageIdFromElement(messageElement);
+        if (!messageElement || messageId === -1) {
+            const snapshot = getFreshSelectionSnapshot();
+            if (snapshot) {
+                messageId = snapshot.messageId;
+                messageElement = getMessageElement(messageId);
+            }
+        }
+
+        if (!messageElement || messageId === -1) {
+            notify('warning', '没有捕获到当前选区，请重新选中正文片段后再点魔法棒。');
+            hideSelectionButton();
+            return;
+        }
+
         openRescueModal(messageId, messageElement);
         hideSelectionButton();
     });
@@ -3433,6 +4502,8 @@ function mountSelectionButton() {
     document.body.append(button);
     document.addEventListener('selectionchange', scheduleSelectionButtonUpdate);
     document.addEventListener('mouseup', scheduleSelectionButtonUpdate);
+    document.addEventListener('pointerup', scheduleSelectionButtonUpdate);
+    document.addEventListener('touchend', scheduleSelectionButtonUpdate);
     document.addEventListener('keyup', scheduleSelectionButtonUpdate);
     document.addEventListener('scroll', updateSelectionButton, true);
     window.addEventListener('resize', hideSelectionButton);

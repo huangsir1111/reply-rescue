@@ -7,7 +7,7 @@
     "js": "index.js",
     "css": "style.css",
     "author": "Codex",
-    "version": "0.1.12",
+    "version": "0.1.16",
     "homepage": "https://github.com/huangsir1111/reply-rescue",
     "hooks": {
         "activate": "init"
