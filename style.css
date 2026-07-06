@@ -397,6 +397,11 @@
     white-space: nowrap;
 }
 
+.rr-danger-button {
+    border-color: color-mix(in srgb, #d9534f 60%, var(--SmartThemeBorderColor));
+    color: color-mix(in srgb, #ff8a84 72%, var(--SmartThemeBodyColor));
+}
+
 .rr-spacer {
     flex: 1;
 }
@@ -432,6 +437,57 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
+}
+
+.rr-api-settings {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--SmartThemeBorderColor);
+}
+
+.rr-api-settings[hidden] {
+    display: none !important;
+}
+
+.rr-api-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: 8px;
+}
+
+.rr-api-toolbar .menu_button {
+    display: inline-flex !important;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    width: auto;
+    min-width: max-content;
+    white-space: nowrap;
+}
+
+.rr-api-preset-field {
+    flex: 1 1 240px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 180px;
+}
+
+.reply-rescue-settings .rr-api-grid {
+    margin: 0;
+}
+
+.reply-rescue-settings .rr-api-wide {
+    grid-column: 1 / -1;
+}
+
+#rr-api-status {
+    flex: 1 1 220px;
+    min-width: 0;
 }
 
 .reply-rescue-settings textarea {
@@ -530,6 +586,17 @@
 
     .rr-modal-actions .menu_button {
         flex: 1 1 auto;
+    }
+
+    .rr-api-toolbar {
+        align-items: stretch;
+    }
+
+    .rr-api-toolbar .menu_button,
+    .rr-api-preset-field,
+    #rr-api-status {
+        flex: 1 1 100%;
+        min-width: 0;
     }
 
     .rr-spacer {

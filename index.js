@@ -23,7 +23,7 @@ import { textgenerationwebui_preset_names, textgenerationwebui_presets, textgene
 
 const MODULE_NAME = 'reply_rescue';
 const DISPLAY_NAME = '回复救急插件';
-const SETTINGS_VERSION = '0.1.16';
+const SETTINGS_VERSION = '0.1.19';
 const MAX_UNDO_RECORDS = 10;
 const WORLD_INFO_METADATA_KEY = 'world_info';
 const CHAT_BASELINE_METADATA_KEY = 'blockBaseline';
@@ -88,6 +88,9 @@ const defaultSettings = {
     statusTemplate: '',
     allowNewStatusbar: false,
     allowNewBlock: false,
+    generationSource: 'sillytavern',
+    activeApiPresetId: 'default',
+    apiPresets: [],
 };
 
 const runtime = {
@@ -131,6 +134,89 @@ function clampInteger(value, fallback, min, max) {
     return Math.min(Math.max(Math.floor(numberValue), min), max);
 }
 
+function clampNumber(value, fallback, min, max) {
+    const numberValue = Number(value);
+    if (!Number.isFinite(numberValue)) {
+        return fallback;
+    }
+
+    return Math.min(Math.max(numberValue, min), max);
+}
+
+function makeApiPresetId() {
+    return `api_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function sanitizeModelList(value) {
+    const seen = new Set();
+    const result = [];
+
+    if (!Array.isArray(value)) {
+        return result;
+    }
+
+    for (const item of value) {
+        const id = typeof item === 'string'
+            ? item.trim()
+            : String(item?.id || item?.name || '').trim();
+        if (!id || seen.has(id)) {
+            continue;
+        }
+
+        seen.add(id);
+        result.push(id);
+    }
+
+    return result;
+}
+
+function createDefaultApiPreset(index = 0) {
+    return {
+        id: makeApiPresetId(),
+        name: index ? `独立 API ${index + 1}` : '默认独立 API',
+        baseUrl: '',
+        apiKey: '',
+        model: '',
+        availableModels: [],
+        temperature: 0.7,
+        maxTokens: defaultSettings.responseLength,
+    };
+}
+
+function sanitizeApiPreset(value, index = 0) {
+    const source = value && typeof value === 'object' ? value : {};
+    const preset = {
+        id: String(source.id || '').trim() || makeApiPresetId(),
+        name: String(source.name || '').trim() || (index ? `独立 API ${index + 1}` : '默认独立 API'),
+        baseUrl: String(source.baseUrl || source.url || '').trim(),
+        apiKey: String(source.apiKey || source.key || '').trim(),
+        model: String(source.model || '').trim(),
+        availableModels: sanitizeModelList(source.availableModels || source.models),
+        temperature: clampNumber(source.temperature, 0.7, 0, 2),
+        maxTokens: clampInteger(source.maxTokens ?? source.responseLength, defaultSettings.responseLength, 80, RESPONSE_LENGTH_MAX),
+    };
+
+    if (preset.model && !preset.availableModels.includes(preset.model)) {
+        preset.availableModels.unshift(preset.model);
+    }
+
+    return preset;
+}
+
+function sanitizeApiPresets(value) {
+    const source = Array.isArray(value) && value.length ? value : [createDefaultApiPreset()];
+    const used = new Set();
+
+    return source.map((item, index) => {
+        const preset = sanitizeApiPreset(item, index);
+        if (used.has(preset.id)) {
+            preset.id = makeApiPresetId();
+        }
+        used.add(preset.id);
+        return preset;
+    });
+}
+
 function getSettings() {
     extension_settings[MODULE_NAME] ||= {};
     const settings = extension_settings[MODULE_NAME];
@@ -152,6 +238,19 @@ function getSettings() {
     settings.allowNewStatusbar = false;
     settings.allowNewBlock = false;
     settings.enabled = settings.enabled !== false;
+    if (!['sillytavern', 'independent'].includes(settings.generationSource)) {
+        settings.generationSource = defaultSettings.generationSource;
+        changed = true;
+    }
+    const serializedApiPresets = JSON.stringify(settings.apiPresets || []);
+    settings.apiPresets = sanitizeApiPresets(settings.apiPresets);
+    if (serializedApiPresets !== JSON.stringify(settings.apiPresets)) {
+        changed = true;
+    }
+    if (!settings.apiPresets.some(preset => preset.id === settings.activeApiPresetId)) {
+        settings.activeApiPresetId = settings.apiPresets[0].id;
+        changed = true;
+    }
 
     if (!Object.hasOwn(modeLabels, settings.defaultMode)) {
         settings.defaultMode = defaultSettings.defaultMode;
@@ -1366,6 +1465,295 @@ function getBlockSignature(block) {
     ].join('|');
 }
 
+const blockMatchStopTokens = new Set([
+    'a', 'abbr', 'article', 'aside', 'body', 'button', 'code', 'container', 'content', 'details', 'div',
+    'figure', 'footer', 'form', 'header', 'html', 'island', 'li', 'main', 'markdown', 'nav', 'ol', 'panel',
+    'pre', 'section', 'span', 'strong', 'summary', 'table', 'tbody', 'td', 'th', 'thead', 'tr', 'ul',
+    'wrapper',
+]);
+
+function normalizeBlockMatchToken(value) {
+    return String(value || '')
+        .replace(/\uFF08[^\uFF09]*\uFF09/gu, ' ')
+        .replace(/\([^)]*\)/gu, ' ')
+        .replace(/(?:\u7f8e\u5316\u5757|\u7ed3\u6784\u5757|\u9762\u677f|panel|block|container|wrapper|island|html|markdown|code)/giu, ' ')
+        .replace(/[^\p{L}\p{N}_-]+/gu, ' ')
+        .trim()
+        .toLowerCase();
+}
+
+function isUsefulBlockMatchToken(token) {
+    const value = String(token || '').trim().toLowerCase();
+    const hasCjk = /[\u3400-\u9fff]/u.test(value);
+    return Boolean(value)
+        && (value.length >= 3 || hasCjk)
+        && !blockMatchStopTokens.has(value)
+        && !/^[a-z](?:[-_][a-z])+$/iu.test(value)
+        && !/^[\d_-]+$/u.test(value);
+}
+
+function addBlockMatchToken(tokens, value) {
+    const normalized = normalizeBlockMatchToken(value);
+    if (!normalized) {
+        return;
+    }
+
+    for (const token of normalized.split(/\s+/u)) {
+        if (isUsefulBlockMatchToken(token)) {
+            tokens.add(token);
+        }
+
+        for (const part of token.split(/[_-]+/u)) {
+            if (isUsefulBlockMatchToken(part)) {
+                tokens.add(part);
+            }
+        }
+    }
+}
+
+function getMarkerNamesForMatch(marker) {
+    const source = String(marker || '').trim();
+    if (!source) {
+        return [];
+    }
+
+    const htmlStart = parseStartTagName(source);
+    const htmlEnd = source.match(/^<\s*\/\s*([^\s/>=]+)\s*>$/u)?.[1] || '';
+    const square = source.match(/^\[\/?([^\]\r\n]{1,80})\]$/u)?.[1] || '';
+    const corner = source.match(/^\u3010\/?([^\u3011\r\n]{1,80})\u3011$/u)?.[1] || '';
+    const quote = source.match(/^\u300C\/?([^\u300D\r\n]{1,80})\u300D$/u)?.[1] || '';
+    const fenceInfo = source.match(/^[`~]{3,}\s*([^\s`~]{1,80})/u)?.[1] || '';
+
+    return [htmlStart, htmlEnd, square, corner, quote, fenceInfo].filter(Boolean);
+}
+
+function addBlockMarkerTokens(tokens, marker) {
+    for (const name of getMarkerNamesForMatch(marker)) {
+        addBlockMatchToken(tokens, name);
+    }
+}
+
+function addOuterTextMarkerTokens(tokens, text) {
+    const source = String(text || '').trim();
+    if (!source) {
+        return;
+    }
+
+    addBlockMarkerTokens(tokens, source.match(/^<[^>]+>/u)?.[0] || '');
+    addBlockMarkerTokens(tokens, source.match(/^\[[^\]\r\n]{1,80}\]/u)?.[0] || '');
+    addBlockMarkerTokens(tokens, source.match(/^\u3010[^\u3011\r\n]{1,80}\u3011/u)?.[0] || '');
+    addBlockMarkerTokens(tokens, source.match(/^\u300C[^\u300D\r\n]{1,80}\u300D/u)?.[0] || '');
+    addBlockMarkerTokens(tokens, source.match(/^[`~]{3,}[^\r\n]*/u)?.[0] || '');
+}
+
+function getBlockMatchTokens(block) {
+    const tokens = new Set();
+    const [startMarker = '', endMarker = ''] = block?.markerPair || [];
+
+    addBlockMatchToken(tokens, block?.label);
+    addBlockMatchToken(tokens, block?.markerName);
+    addBlockMarkerTokens(tokens, startMarker);
+    addBlockMarkerTokens(tokens, endMarker);
+    addOuterTextMarkerTokens(tokens, block?.text);
+    addOuterTextMarkerTokens(tokens, block?.exampleText);
+
+    return tokens;
+}
+
+function getBlockContentMarkerTokens(block) {
+    const source = String(block?.text || block?.exampleText || '');
+    const tokens = new Set();
+    if (!source) {
+        return tokens;
+    }
+
+    const htmlTagRegex = /<(?!\/|!|\?)([^\s/>=]+)(?:\s[^<>]*)?>/gu;
+    let htmlMatch;
+    while ((htmlMatch = htmlTagRegex.exec(source))) {
+        const tagName = htmlMatch[1];
+        const lower = String(tagName || '').toLowerCase();
+        if (!isHtmlTagName(tagName) && !ignoredGenericTagNames.has(lower)) {
+            addBlockMatchToken(tokens, tagName);
+        }
+    }
+
+    const bracketRegex = /\[([^\]\r\n]{1,80})\]/gu;
+    let bracketMatch;
+    while ((bracketMatch = bracketRegex.exec(source))) {
+        const name = String(bracketMatch[1] || '').trim();
+        if (isSafeMarkerName(name) && !name.startsWith('/')) {
+            addBlockMatchToken(tokens, name);
+        }
+    }
+
+    return tokens;
+}
+
+function isPanelLikeBaselineBlock(block) {
+    const label = String(block?.label || block?.markerName || '');
+    const source = String(block?.source || '');
+    return /(?:panel|container|wrapper)/iu.test(label)
+        || /(?:combined|panel|container|wrapper)/iu.test(source)
+        || /\u9762\u677f|\u7ec4\u5408/u.test(`${label}\n${source}`);
+}
+
+function findFallbackBaselineMatch(block, baselineBlocks, matchedBaselineIndexes) {
+    const actualTokens = getBlockMatchTokens(block);
+    if (!actualTokens.size) {
+        return null;
+    }
+
+    let best = null;
+    for (const baselineBlock of baselineBlocks) {
+        if (matchedBaselineIndexes.has(baselineBlock.baselineIndex)) {
+            continue;
+        }
+
+        const baselineTokens = getBlockMatchTokens(baselineBlock);
+        const sharedTokens = [...actualTokens].filter(token => baselineTokens.has(token));
+        if (!sharedTokens.length) {
+            continue;
+        }
+
+        let score = sharedTokens.reduce((sum, token) => sum + Math.min(18, Math.max(8, token.length)), 0);
+        if (block.blockKind === baselineBlock.blockKind) {
+            score += 4;
+        }
+        if (block.occurrence === baselineBlock.occurrence) {
+            score += 2;
+        }
+        score -= Math.min(6, Math.abs((block.actualIndex ?? 0) - baselineBlock.baselineIndex));
+
+        if (!best || score > best.score) {
+            best = { baselineBlock, score };
+        }
+    }
+
+    return best && best.score >= 8 ? best.baselineBlock : null;
+}
+
+function isBaselineCoveredByActualChildren(baselineBlock, actualBlocks) {
+    if (!isPanelLikeBaselineBlock(baselineBlock)) {
+        return false;
+    }
+
+    const childTokens = getBlockContentMarkerTokens(baselineBlock);
+    if (childTokens.size < 2) {
+        return false;
+    }
+
+    const actualTokens = new Set();
+    for (const block of actualBlocks) {
+        for (const token of getBlockMatchTokens(block)) {
+            actualTokens.add(token);
+        }
+    }
+
+    const covered = [...childTokens].filter(token => actualTokens.has(token)).length;
+    return covered >= 2 && covered / childTokens.size >= 0.5;
+}
+
+function findMarkerStartInText(sourceText, marker, fromIndex = 0) {
+    const source = String(sourceText || '');
+    const value = String(marker || '').trim();
+    if (!source || !value) {
+        return null;
+    }
+
+    const exactIndex = source.indexOf(value, fromIndex);
+    if (exactIndex !== -1) {
+        return { index: exactIndex, text: value };
+    }
+
+    const tagName = parseStartTagName(value);
+    if (!tagName || isHtmlTagName(tagName)) {
+        return null;
+    }
+
+    const tagRegex = new RegExp(`<\\s*${escapeRegExp(tagName)}(?:\\s[^<>]*)?>`, 'giu');
+    tagRegex.lastIndex = Math.max(0, fromIndex);
+    const match = tagRegex.exec(source);
+    return match ? { index: match.index, text: match[0] } : null;
+}
+
+function findNextBaselineMarkerStart(source, fromIndex, baselineBlocks, baselineIndex) {
+    let nextIndex = -1;
+    for (const block of baselineBlocks.slice(baselineIndex + 1)) {
+        const [startMarker = ''] = block.markerPair || [];
+        const match = findMarkerStartInText(source, startMarker, fromIndex);
+        if (!match) {
+            continue;
+        }
+
+        if (nextIndex === -1 || match.index < nextIndex) {
+            nextIndex = match.index;
+        }
+    }
+
+    return nextIndex;
+}
+
+function findBaselineBlockRangeInCurrentText(currentText, baselineBlock, baselineIndex, baselineBlocks) {
+    const source = String(currentText || '');
+    const [startMarker = '', endMarker = ''] = baselineBlock?.markerPair || [];
+    const startMatch = findMarkerStartInText(source, startMarker);
+    if (!startMatch) {
+        return null;
+    }
+
+    let end = -1;
+    const afterStart = startMatch.index + startMatch.text.length;
+    if (endMarker) {
+        const exactEnd = source.indexOf(endMarker, afterStart);
+        if (exactEnd !== -1) {
+            end = exactEnd + endMarker.length;
+        }
+    }
+
+    const tagName = parseStartTagName(startMatch.text);
+    if (end === -1 && tagName && !isHtmlTagName(tagName)) {
+        const htmlEnd = findMatchingHtmlEnd(source, startMatch.index, tagName);
+        if (htmlEnd !== -1) {
+            end = htmlEnd;
+        }
+    }
+
+    if (end === -1) {
+        const nextStart = findNextBaselineMarkerStart(source, afterStart, baselineBlocks, baselineIndex);
+        end = nextStart === -1 ? source.trimEnd().length : nextStart;
+    }
+
+    if (end <= startMatch.index || end - startMatch.index > BLOCK_DETECTION_MAX) {
+        return null;
+    }
+
+    const text = source.slice(startMatch.index, end).trimEnd();
+    if (!text.trim()) {
+        return null;
+    }
+
+    return {
+        start: startMatch.index,
+        end: startMatch.index + text.length,
+        text,
+        markerPair: baselineBlock.markerPair,
+        markerName: baselineBlock.label,
+        label: baselineBlock.label,
+        blockKind: baselineBlock.blockKind,
+        source: '疑似损坏',
+        preview: trimText(text.replace(/\s+/gu, ' ').trim(), 120, false),
+        isMissing: false,
+        suspectedBaselineDamage: true,
+        baselineIndex,
+        displayOrder: baselineIndex,
+        signature: baselineBlock.signature,
+        occurrence: baselineBlock.occurrence,
+        identityKey: baselineBlock.identityKey,
+        baselineSourceMessageId: baselineBlock.sourceMessageId,
+        baselinePosition: baselineBlock.position,
+    };
+}
+
 function annotateBlockOccurrences(blocks) {
     const counts = new Map();
     return blocks.map((block, index) => {
@@ -1588,24 +1976,57 @@ function mergeRecognizedBlocksWithBaseline(actualBlocks, baseline, currentText) 
         }));
     }
 
-    const baselineByKey = new Map(baseline.blocks.map((block, index) => [block.identityKey, { ...block, baselineIndex: index }]));
+    const baselineBlocks = baseline.blocks.map((block, index) => ({ ...block, baselineIndex: index }));
+    const baselineByKey = new Map(baselineBlocks.map(block => [block.identityKey, block]));
     const matchedBaselineIndexes = new Set();
-    const merged = actualAnnotated.map((block) => {
+    const matches = actualAnnotated.map((block) => {
         const baselineBlock = baselineByKey.get(block.identityKey);
         if (baselineBlock) {
             matchedBaselineIndexes.add(baselineBlock.baselineIndex);
         }
 
         return {
+            block,
+            baselineBlock,
+            matchedByFallback: false,
+        };
+    });
+
+    for (const match of matches) {
+        if (match.baselineBlock) {
+            continue;
+        }
+
+        const baselineBlock = findFallbackBaselineMatch(match.block, baselineBlocks, matchedBaselineIndexes);
+        if (!baselineBlock) {
+            continue;
+        }
+
+        match.baselineBlock = baselineBlock;
+        match.matchedByFallback = true;
+        matchedBaselineIndexes.add(baselineBlock.baselineIndex);
+    }
+
+    const merged = matches.map(({ block, baselineBlock, matchedByFallback }) => {
+        return {
             ...block,
             isMissing: false,
             baselineIndex: baselineBlock?.baselineIndex ?? -1,
             displayOrder: baselineBlock ? baselineBlock.baselineIndex : baseline.blocks.length + block.actualIndex,
+            matchedBaselineFallback: matchedByFallback,
         };
     });
 
-    for (const [baselineIndex, block] of baseline.blocks.entries()) {
+    for (const [baselineIndex, block] of baselineBlocks.entries()) {
         if (matchedBaselineIndexes.has(baselineIndex)) {
+            continue;
+        }
+        if (isBaselineCoveredByActualChildren(block, actualAnnotated)) {
+            continue;
+        }
+        const damagedBlock = findBaselineBlockRangeInCurrentText(currentText, block, baselineIndex, baselineBlocks);
+        if (damagedBlock) {
+            merged.push(damagedBlock);
             continue;
         }
 
@@ -1640,6 +2061,45 @@ function mergeRecognizedBlocksWithBaseline(actualBlocks, baseline, currentText) 
         }));
 }
 
+function shouldExpandChatBlockBaseline(baseline, actualBlocks, mergedBlocks) {
+    if (!baseline?.blocks?.length || !actualBlocks?.length || actualBlocks.length <= baseline.blocks.length) {
+        return false;
+    }
+
+    if (mergedBlocks.some(block => block?.isMissing || block?.suspectedBaselineDamage)) {
+        return false;
+    }
+
+    const matchedBaselineIndexes = new Set();
+    let hasNewActualBlock = false;
+    for (const block of mergedBlocks) {
+        if (Number.isInteger(block?.baselineIndex) && block.baselineIndex >= 0) {
+            matchedBaselineIndexes.add(block.baselineIndex);
+        } else if (!block?.isMissing && Number.isInteger(block?.start) && block.start >= 0) {
+            hasNewActualBlock = true;
+        }
+    }
+
+    return hasNewActualBlock && matchedBaselineIndexes.size >= baseline.blocks.length;
+}
+
+function maybeExpandChatBlockBaseline(messageId, actualBlocks, baseline, mergedBlocks) {
+    if (!shouldExpandChatBlockBaseline(baseline, actualBlocks, mergedBlocks)) {
+        return null;
+    }
+
+    const nextBaseline = makeChatBlockBaseline(
+        Number.isInteger(messageId) ? messageId : Number(baseline.sourceMessageId ?? -1),
+        actualBlocks,
+    );
+    if (!nextBaseline || nextBaseline.blocks.length <= baseline.blocks.length || nextBaseline.signature === baseline.signature) {
+        return null;
+    }
+
+    saveChatBlockBaseline(nextBaseline);
+    return nextBaseline;
+}
+
 function collectRecognizedBlocks(text, settings = getSettings(), templateText = '', options = {}) {
     const source = String(text || '');
     const actualBlocks = collectActualRecognizedBlocks(source, settings, templateText);
@@ -1647,8 +2107,12 @@ function collectRecognizedBlocks(text, settings = getSettings(), templateText = 
         return actualBlocks;
     }
 
-    const baseline = getChatBlockBaseline(settings, templateText, Number(options.messageId ?? runtime.active?.messageId ?? -1));
-    return mergeRecognizedBlocksWithBaseline(actualBlocks, baseline, source);
+    const messageId = Number(options.messageId ?? runtime.active?.messageId ?? -1);
+    const baseline = getChatBlockBaseline(settings, templateText, messageId);
+    const merged = mergeRecognizedBlocksWithBaseline(actualBlocks, baseline, source);
+    const expandedBaseline = maybeExpandChatBlockBaseline(messageId, actualBlocks, baseline, merged);
+
+    return expandedBaseline ? mergeRecognizedBlocksWithBaseline(actualBlocks, expandedBaseline, source) : merged;
 }
 
 function inferMarkerPairFromBlockText(text) {
@@ -3652,6 +4116,346 @@ async function writeMessageText(messageId, nextText) {
     scheduleButtonRefresh();
 }
 
+function getSelectedDeletableBlocks(blocks = getSelectedRecognizedBlocks()) {
+    return blocks.filter(block => !block?.isMissing
+        && Number.isInteger(block.start)
+        && Number.isInteger(block.end)
+        && block.start >= 0
+        && block.end > block.start
+        && String(block.text || '').trim());
+}
+
+function resolveDeletionRanges(currentText, blocks) {
+    const ranges = blocks
+        .map((block) => {
+            const range = resolveCurrentBlockRange(currentText, {
+                text: block.text,
+                start: block.start,
+                end: block.end,
+            }, block.label || '结构块');
+
+            return {
+                ...range,
+                label: block.label || '结构块',
+            };
+        })
+        .sort((a, b) => a.start - b.start || b.end - a.end);
+
+    for (let index = 1; index < ranges.length; index += 1) {
+        const previous = ranges[index - 1];
+        const current = ranges[index];
+        if (current.start < previous.end) {
+            throw new Error('选中的块互相重叠或存在包含关系；请只选最外层块，或只选彼此独立的块。');
+        }
+    }
+
+    return ranges;
+}
+
+function deleteRangesFromText(text, ranges) {
+    let result = String(text || '');
+    for (const range of [...ranges].sort((a, b) => b.start - a.start)) {
+        const before = result.slice(0, range.start).replace(/[ \t]+$/u, '');
+        const after = result.slice(range.end).replace(/^[ \t]+/u, '');
+        const separator = before && after && !before.endsWith('\n') && !after.startsWith('\n') ? '\n' : '';
+        result = `${before}${separator}${after}`;
+    }
+
+    return result
+        .replace(/[ \t]+\n/gu, '\n')
+        .replace(/\n{3,}/gu, '\n\n')
+        .trimEnd();
+}
+
+async function deleteSelectedRecognizedBlocks() {
+    const button = document.getElementById('rr-delete-blocks');
+    const status = document.getElementById('rr-modal-status');
+
+    try {
+        if (!runtime.active || runtime.active.mode !== 'repair_block') {
+            throw new Error('请先打开识别块 UI。');
+        }
+
+        const selectedBlocks = getSelectedRecognizedBlocks();
+        if (!selectedBlocks.length) {
+            throw new Error('请先在左侧选择要删除的块。');
+        }
+
+        const deletableBlocks = getSelectedDeletableBlocks(selectedBlocks);
+        if (!deletableBlocks.length) {
+            throw new Error('选中的都是缺失占位，没有当前回复原文可删除。');
+        }
+
+        const skippedCount = selectedBlocks.length - deletableBlocks.length;
+        const confirmText = skippedCount
+            ? `确定删除 ${deletableBlocks.length} 个当前存在的块？另外 ${skippedCount} 个缺失占位会被跳过。`
+            : `确定删除选中的 ${deletableBlocks.length} 个块？`;
+        if (!window.confirm(confirmText)) {
+            return;
+        }
+
+        if (button) {
+            button.disabled = true;
+        }
+
+        const before = getMessageText(runtime.active.messageId);
+        const ranges = resolveDeletionRanges(before, deletableBlocks);
+        const after = deleteRangesFromText(before, ranges);
+        if (after === before) {
+            throw new Error('删除后内容没有变化，已取消操作。');
+        }
+
+        runtime.undoStack.push({
+            messageId: runtime.active.messageId,
+            before,
+            after,
+            mode: 'delete_blocks',
+            time: new Date().toISOString(),
+        });
+        runtime.undoStack = runtime.undoStack.slice(-MAX_UNDO_RECORDS);
+
+        await writeMessageText(runtime.active.messageId, after);
+        resetRecognizedBlockSelection();
+        renderRecognizedBlocks(-1);
+
+        const message = skippedCount
+            ? `已删除 ${ranges.length} 个当前存在的块；${skippedCount} 个缺失占位已跳过。`
+            : `已删除 ${ranges.length} 个选中块。`;
+        if (status) {
+            status.textContent = message;
+        }
+        notify('success', message);
+    } catch (error) {
+        const message = error?.message || String(error);
+        if (status) {
+            status.textContent = message;
+        }
+        notify('error', message);
+    } finally {
+        updateDeleteSelectedBlocksButton();
+    }
+}
+
+function getActiveApiPreset(settings = getSettings()) {
+    return settings.apiPresets.find(preset => preset.id === settings.activeApiPresetId) || settings.apiPresets[0];
+}
+
+function getAuthHeaderValue(apiKey) {
+    const value = String(apiKey || '').trim();
+    if (!value) {
+        return '';
+    }
+
+    return /^(Bearer|Basic)\s+/iu.test(value) ? value : `Bearer ${value}`;
+}
+
+function normalizeApiBaseUrl(baseUrl) {
+    const value = String(baseUrl || '').trim().replace(/\/+$/u, '');
+    if (!value) {
+        throw new Error('请先填写独立 API 地址。');
+    }
+
+    return value.replace(/\/(?:chat\/completions|completions|models)$/iu, '');
+}
+
+function buildIndependentApiEndpoint(baseUrl, endpoint) {
+    return `${normalizeApiBaseUrl(baseUrl)}/${endpoint.replace(/^\/+/u, '')}`;
+}
+
+function buildIndependentApiHeaders(preset, includeJson = false) {
+    const headers = {};
+    const auth = getAuthHeaderValue(preset?.apiKey);
+    if (auth) {
+        headers.Authorization = auth;
+    }
+    if (includeJson) {
+        headers['Content-Type'] = 'application/json';
+    }
+
+    return headers;
+}
+
+async function parseApiErrorResponse(response) {
+    const fallback = `${response.status} ${response.statusText}`.trim();
+    let body = '';
+    try {
+        body = await response.text();
+    } catch {
+        return fallback;
+    }
+
+    if (!body) {
+        return fallback;
+    }
+
+    try {
+        const json = JSON.parse(body);
+        return json?.error?.message || json?.message || json?.detail || body.slice(0, 500);
+    } catch {
+        return body.slice(0, 500);
+    }
+}
+
+function extractIndependentModels(data) {
+    const source = Array.isArray(data?.data)
+        ? data.data
+        : Array.isArray(data?.models)
+            ? data.models
+            : Array.isArray(data)
+                ? data
+                : [];
+
+    return sanitizeModelList(source);
+}
+
+async function fetchIndependentApiModels(preset) {
+    if (!preset?.baseUrl) {
+        throw new Error('请先填写独立 API 地址。');
+    }
+
+    const url = buildIndependentApiEndpoint(preset.baseUrl, 'models');
+    let response;
+    try {
+        response = await fetch(url, {
+            method: 'GET',
+            headers: buildIndependentApiHeaders(preset),
+        });
+    } catch (error) {
+        if (error instanceof TypeError) {
+            throw new Error('无法连接独立 API。请检查 URL，或确认该接口允许浏览器跨域请求（CORS）。');
+        }
+        throw error;
+    }
+
+    if (!response.ok) {
+        throw new Error(`识别模型失败：${await parseApiErrorResponse(response)}`);
+    }
+
+    const data = await response.json();
+    const models = extractIndependentModels(data);
+    if (!models.length) {
+        throw new Error('接口已响应，但没有识别到可用模型。请确认它兼容 /models 格式。');
+    }
+
+    return models;
+}
+
+function extractTextFromContentParts(content) {
+    if (typeof content === 'string') {
+        return content;
+    }
+
+    if (!Array.isArray(content)) {
+        return '';
+    }
+
+    return content
+        .map(part => typeof part === 'string' ? part : part?.text || part?.content || '')
+        .join('');
+}
+
+function extractIndependentApiText(data) {
+    const choice = Array.isArray(data?.choices) ? data.choices[0] : null;
+    const chatText = extractTextFromContentParts(choice?.message?.content);
+    if (chatText) {
+        return chatText;
+    }
+
+    if (typeof choice?.text === 'string') {
+        return choice.text;
+    }
+
+    if (typeof data?.output_text === 'string') {
+        return data.output_text;
+    }
+
+    if (Array.isArray(data?.output)) {
+        return data.output
+            .flatMap(item => Array.isArray(item?.content) ? item.content : [])
+            .map(part => part?.text || part?.content || '')
+            .join('');
+    }
+
+    return '';
+}
+
+async function generateWithIndependentApi(prompt, settings = getSettings()) {
+    const preset = getActiveApiPreset(settings);
+    if (!preset?.baseUrl) {
+        throw new Error('请先在回复救急插件设置里填写独立 API 地址。');
+    }
+    if (!preset.model) {
+        throw new Error('请先识别并选择一个可用模型。');
+    }
+
+    const url = buildIndependentApiEndpoint(preset.baseUrl, 'chat/completions');
+    const body = {
+        model: preset.model,
+        messages: [
+            {
+                role: 'system',
+                content: '你是一个只按要求修复既有回复片段的助手。必须依据用户提供的预设、世界书、正则、上下文和原文证据；不要解释，不要新增无依据事实，不要胡编乱造。',
+            },
+            {
+                role: 'user',
+                content: prompt,
+            },
+        ],
+        temperature: clampNumber(preset.temperature, 0.7, 0, 2),
+        max_tokens: clampInteger(preset.maxTokens, settings.responseLength, 80, RESPONSE_LENGTH_MAX),
+        stream: false,
+    };
+
+    let response;
+    try {
+        response = await fetch(url, {
+            method: 'POST',
+            headers: buildIndependentApiHeaders(preset, true),
+            body: JSON.stringify(body),
+        });
+    } catch (error) {
+        if (error instanceof TypeError) {
+            throw new Error('无法连接独立 API。请检查 URL，或确认该接口允许浏览器跨域请求（CORS）。');
+        }
+        throw error;
+    }
+
+    if (!response.ok) {
+        throw new Error(`独立 API 生成失败：${await parseApiErrorResponse(response)}`);
+    }
+
+    const data = await response.json();
+    const text = extractIndependentApiText(data).trim();
+    if (!text) {
+        throw new Error('独立 API 返回了空内容，已拒绝预览。');
+    }
+
+    return text;
+}
+
+async function generateRepairOutput(prompt) {
+    const settings = getSettings();
+    if (settings.generationSource === 'independent') {
+        return generateWithIndependentApi(prompt, settings);
+    }
+
+    return generateRaw({
+        prompt,
+        responseLength: settings.responseLength,
+        trimNames: true,
+    });
+}
+
+function getGenerationStatusText() {
+    const settings = getSettings();
+    if (settings.generationSource !== 'independent') {
+        return '正在调用当前酒馆配置的模型...';
+    }
+
+    const preset = getActiveApiPreset(settings);
+    return `正在调用独立 API：${preset?.name || '未命名预设'}...`;
+}
+
 async function generatePreview() {
     const button = document.getElementById('rr-generate');
     const preview = document.getElementById('rr-preview');
@@ -3664,14 +4468,10 @@ async function generatePreview() {
 
         const prompt = buildPromptForActive();
         button.disabled = true;
-        status.textContent = '正在调用当前酒馆配置的模型...';
+        status.textContent = getGenerationStatusText();
         preview.value = '';
 
-        const output = await generateRaw({
-            prompt,
-            responseLength: getSettings().responseLength,
-            trimNames: true,
-        });
+        const output = await generateRepairOutput(prompt);
         let clean = stripWrappingCodeFence(output);
         if (runtime.active.mode === 'repair_statebar') {
             clean = normalizeStatusOutput(output);
@@ -3839,6 +4639,7 @@ function refreshModalSource() {
         resetRecognizedBlockSelection();
         runtime.active.selectedBlockKind = 'auto';
     }
+    updateDeleteSelectedBlocksButton();
 }
 
 function setStatusSource(kind) {
@@ -3980,8 +4781,27 @@ function syncRecognizedBlockSelectionUi() {
     });
 }
 
+function updateDeleteSelectedBlocksButton() {
+    const button = document.getElementById('rr-delete-blocks');
+    if (!button) {
+        return;
+    }
+
+    const selectedBlocks = runtime.active?.mode === 'repair_block' ? getSelectedRecognizedBlocks() : [];
+    const deletableCount = getSelectedDeletableBlocks(selectedBlocks).length;
+    const skippedCount = selectedBlocks.length - deletableCount;
+    button.hidden = runtime.active?.mode !== 'repair_block';
+    button.disabled = deletableCount <= 0;
+    button.title = deletableCount
+        ? skippedCount
+            ? `删除选中的 ${deletableCount} 个当前存在的块；${skippedCount} 个缺失占位会跳过`
+            : `删除选中的 ${deletableCount} 个块`
+        : '先选择当前回复里真实存在的块；缺失占位不能删除';
+}
+
 function updateSelectedRecognizedBlocks({ refreshTemplates = false } = {}) {
     if (!runtime.active) {
+        updateDeleteSelectedBlocksButton();
         return;
     }
 
@@ -4013,6 +4833,7 @@ function updateSelectedRecognizedBlocks({ refreshTemplates = false } = {}) {
         if (statusElement) {
             statusElement.textContent = '';
         }
+        updateDeleteSelectedBlocksButton();
         return;
     }
 
@@ -4055,6 +4876,7 @@ function updateSelectedRecognizedBlocks({ refreshTemplates = false } = {}) {
     if (statusElement) {
         statusElement.textContent = '';
     }
+    updateDeleteSelectedBlocksButton();
 
     if (refreshTemplates) {
         runtime.active.blockTemplateCandidates = [];
@@ -4081,7 +4903,7 @@ function toggleRecognizedBlockSelection(index, { refreshTemplates = false } = {}
     updateSelectedRecognizedBlocks({ refreshTemplates });
 }
 
-function renderRecognizedBlocks(preferredIndex = 0, { refreshTemplates = false } = {}) {
+function renderRecognizedBlocks(preferredIndex = -1, { refreshTemplates = false } = {}) {
     const list = document.getElementById('rr-block-list');
     if (!runtime.active || !list) {
         return;
@@ -4093,7 +4915,7 @@ function renderRecognizedBlocks(preferredIndex = 0, { refreshTemplates = false }
     const currentText = getMessageText(runtime.active.messageId);
     const templateText = getCurrentTemplateEvidenceText();
     runtime.recognizedBlocks = collectRecognizedBlocks(currentText, getSettings(), templateText);
-    const previousIndex = Number.isInteger(preferredIndex) ? preferredIndex : runtime.selectedBlockIndex;
+    const previousIndex = Number.isInteger(preferredIndex) && preferredIndex >= 0 ? preferredIndex : -1;
     resetRecognizedBlockSelection();
     list.replaceChildren();
 
@@ -4107,6 +4929,7 @@ function renderRecognizedBlocks(preferredIndex = 0, { refreshTemplates = false }
         document.getElementById('rr-source-warning').textContent = '没有选中块；请先点左侧识别结果。';
         document.getElementById('rr-preview').value = '';
         runtime.active.selectedBlockKind = 'auto';
+        updateDeleteSelectedBlocksButton();
         return;
     }
 
@@ -4142,8 +4965,8 @@ function renderRecognizedBlocks(preferredIndex = 0, { refreshTemplates = false }
         }
     });
 
-    if (!getSelectedBlockIndexes().length) {
-        const nextIndex = runtime.recognizedBlocks[previousIndex] ? previousIndex : 0;
+    if (!getSelectedBlockIndexes().length && previousIndex >= 0 && runtime.recognizedBlocks[previousIndex]) {
+        const nextIndex = previousIndex;
         ensureSelectedBlockIndexSet().add(nextIndex);
         runtime.selectedBlockIndex = nextIndex;
     }
@@ -4337,6 +5160,7 @@ function closeRescueModal() {
     runtime.active = null;
     runtime.recognizedBlocks = [];
     resetRecognizedBlockSelection();
+    updateDeleteSelectedBlocksButton();
 }
 
 function resetModalForChatChange() {
@@ -4347,6 +5171,7 @@ function resetModalForChatChange() {
         runtime.active = null;
         runtime.recognizedBlocks = [];
         resetRecognizedBlockSelection();
+        updateDeleteSelectedBlocksButton();
     }
 }
 
@@ -4624,6 +5449,7 @@ function mountModal() {
         <div id="rr-modal-status" class="rr-status"></div>
         <div class="rr-modal-actions">
             <button id="rr-undo" class="menu_button"><i class="fa-solid fa-rotate-left"></i>撤销上次急救</button>
+            <button id="rr-delete-blocks" class="menu_button rr-danger-button" type="button" disabled hidden><i class="fa-solid fa-trash-can"></i>删除选中块</button>
             <div class="rr-spacer"></div>
             <button id="rr-cancel" class="menu_button">取消</button>
             <button id="rr-generate" class="menu_button"><i class="fa-solid fa-wand-magic-sparkles"></i>生成修复预览</button>
@@ -4642,6 +5468,7 @@ function mountModal() {
     document.getElementById('rr-generate').addEventListener('click', generatePreview);
     document.getElementById('rr-apply').addEventListener('click', applyPreview);
     document.getElementById('rr-undo').addEventListener('click', undoLastRepair);
+    document.getElementById('rr-delete-blocks')?.addEventListener('click', deleteSelectedRecognizedBlocks);
     document.getElementById('rr-status-auto')?.addEventListener('click', () => setStatusSource('auto'));
     document.getElementById('rr-status-last-block')?.addEventListener('click', () => setStatusSource('last_block'));
     document.getElementById('rr-status-tail')?.addEventListener('click', () => setStatusSource('tail'));
@@ -4658,6 +5485,200 @@ function mountModal() {
     });
 
     runtime.modalMounted = true;
+}
+
+function setApiSettingsVisibility() {
+    const settings = getSettings();
+    const sourceSelect = document.getElementById('rr-setting-generation-source');
+    const apiPanel = document.getElementById('rr-api-settings');
+
+    if (sourceSelect) {
+        sourceSelect.value = settings.generationSource;
+    }
+    if (apiPanel) {
+        apiPanel.hidden = settings.generationSource !== 'independent';
+    }
+}
+
+function fillApiModelControls(preset) {
+    const modelSelect = document.getElementById('rr-api-model');
+    const modelManual = document.getElementById('rr-api-model-manual');
+    if (!modelSelect) {
+        return;
+    }
+
+    const models = sanitizeModelList(preset?.availableModels || []);
+    modelSelect.innerHTML = '';
+    if (models.length) {
+        for (const model of models) {
+            modelSelect.append(new Option(model, model));
+        }
+        modelSelect.disabled = false;
+        modelSelect.value = models.includes(preset.model) ? preset.model : models[0];
+    } else {
+        modelSelect.append(new Option('请先识别可用模型', ''));
+        modelSelect.disabled = true;
+        modelSelect.value = '';
+    }
+
+    if (modelManual) {
+        modelManual.value = preset?.model || modelSelect.value || '';
+    }
+}
+
+function fillApiPresetForm() {
+    const settings = getSettings();
+    const preset = getActiveApiPreset(settings);
+    if (!preset) {
+        return;
+    }
+
+    const presetSelect = document.getElementById('rr-api-preset');
+    if (presetSelect) {
+        presetSelect.innerHTML = '';
+        for (const item of settings.apiPresets) {
+            presetSelect.append(new Option(item.name || '未命名预设', item.id));
+        }
+        presetSelect.value = preset.id;
+    }
+
+    const setValue = (id, value) => {
+        const element = document.getElementById(id);
+        if (element) {
+            element.value = String(value ?? '');
+        }
+    };
+
+    setValue('rr-api-name', preset.name);
+    setValue('rr-api-url', preset.baseUrl);
+    setValue('rr-api-key', preset.apiKey);
+    setValue('rr-api-max-tokens', preset.maxTokens);
+    setValue('rr-api-temperature', preset.temperature);
+    fillApiModelControls(preset);
+    setApiSettingsVisibility();
+}
+
+function readApiPresetFormValues(basePreset, index = 0) {
+    const valueOf = id => String(document.getElementById(id)?.value || '').trim();
+    const selectedModel = valueOf('rr-api-model-manual') || valueOf('rr-api-model');
+    const modelSelect = document.getElementById('rr-api-model');
+    const availableModels = modelSelect
+        ? Array.from(modelSelect.options).map(option => option.value).filter(Boolean)
+        : basePreset.availableModels;
+
+    return sanitizeApiPreset({
+        ...basePreset,
+        name: valueOf('rr-api-name') || basePreset.name,
+        baseUrl: valueOf('rr-api-url'),
+        apiKey: valueOf('rr-api-key'),
+        model: selectedModel,
+        availableModels,
+        maxTokens: document.getElementById('rr-api-max-tokens')?.value || basePreset.maxTokens,
+        temperature: document.getElementById('rr-api-temperature')?.value || basePreset.temperature,
+    }, index);
+}
+
+function saveActiveApiPresetFromUi({ silent = false } = {}) {
+    const settings = getSettings();
+    const index = settings.apiPresets.findIndex(preset => preset.id === settings.activeApiPresetId);
+    if (index === -1) {
+        return null;
+    }
+
+    const saved = readApiPresetFormValues(settings.apiPresets[index], index);
+    settings.apiPresets[index] = saved;
+    settings.activeApiPresetId = saved.id;
+    saveSettingsDebounced();
+    fillApiPresetForm();
+
+    if (!silent) {
+        notify('success', '独立 API 预设已保存。');
+    }
+
+    return saved;
+}
+
+async function loadModelsForActiveApiPreset() {
+    const button = document.getElementById('rr-api-load-models');
+    const status = document.getElementById('rr-api-status');
+    try {
+        const preset = saveActiveApiPresetFromUi({ silent: true });
+        if (!preset) {
+            throw new Error('没有可用的独立 API 预设。');
+        }
+
+        if (button) {
+            button.disabled = true;
+        }
+        if (status) {
+            status.textContent = '正在识别可用模型...';
+        }
+
+        const models = await fetchIndependentApiModels(preset);
+        const settings = getSettings();
+        const index = settings.apiPresets.findIndex(item => item.id === preset.id);
+        if (index !== -1) {
+            settings.apiPresets[index] = sanitizeApiPreset({
+                ...settings.apiPresets[index],
+                availableModels: models,
+                model: models.includes(settings.apiPresets[index].model) ? settings.apiPresets[index].model : models[0],
+            }, index);
+            settings.activeApiPresetId = settings.apiPresets[index].id;
+            saveSettingsDebounced();
+        }
+
+        fillApiPresetForm();
+        const message = `已识别 ${models.length} 个可用模型，请选择后保存。`;
+        if (status) {
+            status.textContent = message;
+        }
+        notify('success', message);
+    } catch (error) {
+        const message = error?.message || String(error);
+        if (status) {
+            status.textContent = message;
+        }
+        notify('error', message);
+    } finally {
+        if (button) {
+            button.disabled = false;
+        }
+    }
+}
+
+function addApiPresetFromUi() {
+    saveActiveApiPresetFromUi({ silent: true });
+    const settings = getSettings();
+    const preset = createDefaultApiPreset(settings.apiPresets.length);
+    settings.apiPresets.push(preset);
+    settings.activeApiPresetId = preset.id;
+    settings.generationSource = 'independent';
+    saveSettingsDebounced();
+    fillApiPresetForm();
+    notify('success', '已新增独立 API 预设。');
+}
+
+function deleteActiveApiPresetFromUi() {
+    const settings = getSettings();
+    if (settings.apiPresets.length <= 1) {
+        settings.apiPresets = [createDefaultApiPreset()];
+        settings.activeApiPresetId = settings.apiPresets[0].id;
+        saveSettingsDebounced();
+        fillApiPresetForm();
+        notify('info', '已重置最后一个独立 API 预设。');
+        return;
+    }
+
+    const index = settings.apiPresets.findIndex(preset => preset.id === settings.activeApiPresetId);
+    if (index === -1) {
+        return;
+    }
+
+    settings.apiPresets.splice(index, 1);
+    settings.activeApiPresetId = settings.apiPresets[Math.max(0, index - 1)].id;
+    saveSettingsDebounced();
+    fillApiPresetForm();
+    notify('success', '已删除独立 API 预设。');
 }
 
 function mountSettings() {
@@ -4709,6 +5730,66 @@ function mountSettings() {
                         <small class="rr-help">限制模型本次急救输出长度，避免整段重写失控。</small>
                         <input id="rr-setting-response-length" class="text_pole" type="number" min="80" max="${RESPONSE_LENGTH_MAX}" step="20">
                     </label>
+                    <label>
+                        <span>生成来源</span>
+                        <small class="rr-help">默认使用当前酒馆模型；也可以改用下方保存的独立 API。</small>
+                        <select id="rr-setting-generation-source" class="text_pole">
+                            <option value="sillytavern">当前酒馆模型</option>
+                            <option value="independent">独立 API</option>
+                        </select>
+                    </label>
+                </div>
+                <div id="rr-api-settings" class="rr-api-settings" hidden>
+                    <div class="rr-api-toolbar">
+                        <label class="rr-api-preset-field">
+                            <span>API 预设</span>
+                            <select id="rr-api-preset" class="text_pole"></select>
+                        </label>
+                        <button id="rr-api-add" class="menu_button" type="button"><i class="fa-solid fa-plus"></i>新增预设</button>
+                        <button id="rr-api-delete" class="menu_button rr-danger-button" type="button"><i class="fa-solid fa-trash-can"></i>删除预设</button>
+                    </div>
+                    <div class="rr-settings-grid rr-api-grid">
+                        <label>
+                            <span>自定义名称</span>
+                            <small class="rr-help">只用于你自己区分不同接口。</small>
+                            <input id="rr-api-name" class="text_pole" type="text" placeholder="例如：备用急救 API">
+                        </label>
+                        <label class="rr-api-wide">
+                            <span>API URL</span>
+                            <small class="rr-help">填写 OpenAI 兼容地址，例如 https://example.com/v1。</small>
+                            <input id="rr-api-url" class="text_pole" type="url" placeholder="https://api.example.com/v1">
+                        </label>
+                        <label class="rr-api-wide">
+                            <span>API Key</span>
+                            <small class="rr-help">Key 会保存在本地酒馆设置里，只建议个人电脑使用。</small>
+                            <input id="rr-api-key" class="text_pole" type="password" autocomplete="off" placeholder="sk-...">
+                        </label>
+                        <label>
+                            <span>选中模型</span>
+                            <small class="rr-help">点“识别可用模型”后在这里选择。</small>
+                            <select id="rr-api-model" class="text_pole"></select>
+                        </label>
+                        <label>
+                            <span>手填模型名</span>
+                            <small class="rr-help">识别失败但你知道模型名时使用。</small>
+                            <input id="rr-api-model-manual" class="text_pole" type="text" placeholder="model-id">
+                        </label>
+                        <label>
+                            <span>独立 API 输出长度</span>
+                            <small class="rr-help">最大 ${RESPONSE_LENGTH_MAX}，只影响独立 API。</small>
+                            <input id="rr-api-max-tokens" class="text_pole" type="number" min="80" max="${RESPONSE_LENGTH_MAX}" step="20">
+                        </label>
+                        <label>
+                            <span>温度</span>
+                            <small class="rr-help">越低越稳，建议 0.3 到 0.8。</small>
+                            <input id="rr-api-temperature" class="text_pole" type="number" min="0" max="2" step="0.1">
+                        </label>
+                    </div>
+                    <div class="rr-api-toolbar rr-api-actions">
+                        <button id="rr-api-load-models" class="menu_button" type="button"><i class="fa-solid fa-list-check"></i>识别可用模型</button>
+                        <button id="rr-api-save" class="menu_button" type="button"><i class="fa-solid fa-floppy-disk"></i>保存 API 预设</button>
+                        <span id="rr-api-status" class="rr-settings-note"></span>
+                    </div>
                 </div>
             </div>
         </div>
@@ -4723,6 +5804,8 @@ function mountSettings() {
     document.getElementById('rr-setting-context-length').value = String(settings.contextLength);
     document.getElementById('rr-setting-recent-messages').value = String(settings.recentMessages);
     document.getElementById('rr-setting-response-length').value = String(settings.responseLength);
+    document.getElementById('rr-setting-generation-source').value = settings.generationSource;
+    fillApiPresetForm();
 
     bind('rr-setting-enabled', 'change', (event) => {
         getSettings().enabled = event.currentTarget.checked;
@@ -4747,6 +5830,28 @@ function mountSettings() {
         getSettings().responseLength = clampInteger(event.currentTarget.value, defaultSettings.responseLength, 80, RESPONSE_LENGTH_MAX);
         event.currentTarget.value = String(getSettings().responseLength);
         saveSettingsDebounced();
+    });
+    bind('rr-setting-generation-source', 'change', (event) => {
+        getSettings().generationSource = event.currentTarget.value === 'independent' ? 'independent' : 'sillytavern';
+        saveSettingsDebounced();
+        setApiSettingsVisibility();
+    });
+    bind('rr-api-preset', 'change', (event) => {
+        const nextPresetId = event.currentTarget.value;
+        saveActiveApiPresetFromUi({ silent: true });
+        getSettings().activeApiPresetId = nextPresetId;
+        saveSettingsDebounced();
+        fillApiPresetForm();
+    });
+    bind('rr-api-add', 'click', addApiPresetFromUi);
+    bind('rr-api-delete', 'click', deleteActiveApiPresetFromUi);
+    bind('rr-api-load-models', 'click', loadModelsForActiveApiPreset);
+    bind('rr-api-save', 'click', () => saveActiveApiPresetFromUi({ silent: false }));
+    bind('rr-api-model', 'change', (event) => {
+        const manual = document.getElementById('rr-api-model-manual');
+        if (manual) {
+            manual.value = event.currentTarget.value;
+        }
     });
 
     runtime.settingsMounted = true;
