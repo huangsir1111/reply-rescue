@@ -6,6 +6,7 @@ import {
     eventSource,
     event_types,
     generateRaw,
+    getRequestHeaders,
     saveChatConditional,
     saveSettingsDebounced,
     this_chid,
@@ -23,7 +24,7 @@ import { textgenerationwebui_preset_names, textgenerationwebui_presets, textgene
 
 const MODULE_NAME = 'reply_rescue';
 const DISPLAY_NAME = '回复救急插件';
-const SETTINGS_VERSION = '0.1.19';
+const SETTINGS_VERSION = '0.1.24';
 const MAX_UNDO_RECORDS = 10;
 const WORLD_INFO_METADATA_KEY = 'world_info';
 const CHAT_BASELINE_METADATA_KEY = 'blockBaseline';
@@ -32,6 +33,15 @@ const CONTEXT_LENGTH_MAX = 100000;
 const RESPONSE_LENGTH_MAX = 20000;
 const BLOCK_DETECTION_MAX = 100000;
 const BASELINE_EXAMPLE_MAX = 20000;
+const INDEPENDENT_API_SAFE_MAX_TOKENS = 4096;
+const INDEPENDENT_API_LARGE_PROMPT_MAX_TOKENS = 2048;
+const INDEPENDENT_API_SAFE_CONTEXT_MAX = 2000;
+const INDEPENDENT_API_GEMINI_MAX_TOKENS = 2048;
+const INDEPENDENT_API_GEMINI_CONTEXT_MAX = 1200;
+const INDEPENDENT_API_LARGE_PROMPT_CHAR_THRESHOLD = 50000;
+const INDEPENDENT_API_MAX_RETRIES = 100;
+const INDEPENDENT_API_PROMPT_CONTEXT_MAX = 8000;
+const INDEPENDENT_API_SYSTEM_PROMPT = '你是一个只按要求修复既有回复片段的助手。必须依据用户提供的预设、世界书、正则、上下文和原文证据；不要解释，不要新增无依据事实，不要胡编乱造。';
 
 const modeLabels = {
     rewrite_selection: '重写选中片段',
@@ -89,6 +99,7 @@ const defaultSettings = {
     allowNewStatusbar: false,
     allowNewBlock: false,
     generationSource: 'sillytavern',
+    independentApiRetryCount: 3,
     activeApiPresetId: 'default',
     apiPresets: [],
 };
@@ -237,6 +248,7 @@ function getSettings() {
     settings.statusTemplate = String(settings.statusTemplate || '');
     settings.allowNewStatusbar = false;
     settings.allowNewBlock = false;
+    settings.independentApiRetryCount = clampInteger(settings.independentApiRetryCount, defaultSettings.independentApiRetryCount, 0, INDEPENDENT_API_MAX_RETRIES);
     settings.enabled = settings.enabled !== false;
     if (!['sillytavern', 'independent'].includes(settings.generationSource)) {
         settings.generationSource = defaultSettings.generationSource;
@@ -4088,6 +4100,82 @@ function buildRepairedMessageText(active, replacementText) {
     }
 }
 
+function normalizeGeneratedPreviewOutput(output) {
+    let clean = stripWrappingCodeFence(output);
+    if (runtime.active.mode === 'repair_statebar') {
+        clean = normalizeStatusOutput(output);
+    } else if (runtime.active.mode === 'repair_block') {
+        clean = runtime.active.blockEvidence?.applyMode === 'replace_multiple_blocks'
+            ? normalizeMultiBlockOutput(output, runtime.active.blockEvidence)
+            : normalizeBlockOutput(output, runtime.active.blockEvidence);
+    }
+
+    if (!clean.trim()) {
+        throw new Error('模型返回了空内容，已拒绝预览。');
+    }
+
+    rejectUnchangedPreviewWhenRequested(clean);
+    return clean;
+}
+
+function normalizePreviewCompareText(text) {
+    return stripWrappingCodeFence(text)
+        .replace(/\s+/gu, '')
+        .trim();
+}
+
+function rejectUnchangedPreviewWhenRequested(clean) {
+    if (getSettings().generationSource !== 'independent') {
+        return;
+    }
+
+    const rawInstruction = String(document.getElementById('rr-instruction')?.value || '').trim();
+    if (!rawInstruction || !runtime.active) {
+        return;
+    }
+
+    const cleanCompare = normalizePreviewCompareText(clean);
+    if (!cleanCompare) {
+        return;
+    }
+
+    if (runtime.active.mode === 'rewrite_selection') {
+        const original = runtime.active.selectionRange?.selectedRawText || runtime.active.selectedText || '';
+        if (original && cleanCompare === normalizePreviewCompareText(original)) {
+            throw new Error('模型返回内容和选中片段一致，正在自动重试。');
+        }
+        return;
+    }
+
+    if (runtime.active.mode === 'repair_statebar') {
+        const evidence = runtime.active.statusEvidence;
+        const original = evidence?.applyTarget || evidence?.targetBlock || '';
+        if (original && cleanCompare === normalizePreviewCompareText(original)) {
+            throw new Error('模型返回内容和原状态栏一致，正在自动重试。');
+        }
+        return;
+    }
+
+    if (runtime.active.mode === 'repair_block') {
+        const evidence = runtime.active.blockEvidence;
+        if (evidence?.applyMode === 'replace_multiple_blocks') {
+            const payload = parseMultiBlockPreview(clean, evidence);
+            const comparable = payload.replacements.filter(({ target }) => !target.missing && target.text);
+            if (comparable.length && comparable.every(({ target, text }) => normalizePreviewCompareText(text) === normalizePreviewCompareText(target.text))) {
+                throw new Error('模型返回内容和选中的原块一致，正在自动重试。');
+            }
+            return;
+        }
+
+        if (evidence?.applyMode !== 'insert_missing') {
+            const original = evidence?.applyTarget || evidence?.targetBlock || '';
+            if (original && cleanCompare === normalizePreviewCompareText(original)) {
+                throw new Error('模型返回内容和原块一致，正在自动重试。');
+            }
+        }
+    }
+}
+
 async function writeMessageText(messageId, nextText) {
     const message = getCurrentMessage(messageId);
     if (!message) {
@@ -4236,17 +4324,82 @@ async function deleteSelectedRecognizedBlocks() {
     }
 }
 
-function getActiveApiPreset(settings = getSettings()) {
-    return settings.apiPresets.find(preset => preset.id === settings.activeApiPresetId) || settings.apiPresets[0];
+const independentPromptContextBlockedKeyPattern = /(api[_-]?key|secret|token|password|credential|authorization|bearer|cookie|jailbreak|bypass|nsfw|破限|越狱|解限)/iu;
+
+function addIndependentPromptContextParts(parts, title, value) {
+    const snippets = collectPresetTextParts(value, 'auto')
+        .filter(part => !independentPromptContextBlockedKeyPattern.test(part.slice(0, 160)))
+        .slice(0, 12);
+    if (!snippets.length) {
+        return;
+    }
+
+    parts.push([
+        `【${title}】`,
+        snippets.join('\n\n'),
+    ].join('\n'));
 }
 
-function getAuthHeaderValue(apiKey) {
-    const value = String(apiKey || '').trim();
-    if (!value) {
+function collectIndependentTavernPromptContext(options = {}) {
+    const maxLength = clampInteger(
+        options.maxLength,
+        INDEPENDENT_API_PROMPT_CONTEXT_MAX,
+        0,
+        INDEPENDENT_API_PROMPT_CONTEXT_MAX,
+    );
+    if (maxLength <= 0) {
         return '';
     }
 
-    return /^(Bearer|Basic)\s+/iu.test(value) ? value : `Bearer ${value}`;
+    const parts = [];
+
+    try {
+        const openAiPresetName = oai_settings?.preset_settings_openai;
+        addIndependentPromptContextParts(parts, '当前 Chat Completion 设置', oai_settings);
+        addIndependentPromptContextParts(parts, `Chat Completion 预设：${openAiPresetName || '当前'}`, getOpenAiPresetByName(openAiPresetName));
+
+        const textGenPresetName = textgenerationwebui_settings?.preset;
+        addIndependentPromptContextParts(parts, '当前 Text Completion 设置', textgenerationwebui_settings);
+        addIndependentPromptContextParts(parts, `Text Completion 预设：${textGenPresetName || '当前'}`, getTextGenPresetByName(textGenPresetName));
+
+        const contextName = power_user?.context?.preset;
+        addIndependentPromptContextParts(parts, `上下文模板：${contextName || '当前'}`, power_user?.context);
+        addIndependentPromptContextParts(parts, `上下文预设：${contextName || '当前'}`, findPresetByName(context_presets, contextName));
+
+        const instructName = power_user?.instruct?.preset;
+        addIndependentPromptContextParts(parts, `指令模板：${instructName || '当前'}`, power_user?.instruct);
+        addIndependentPromptContextParts(parts, `指令预设：${instructName || '当前'}`, findPresetByName(instruct_presets, instructName));
+
+        const systemPromptName = power_user?.sysprompt?.name;
+        addIndependentPromptContextParts(parts, `系统提示：${systemPromptName || '当前'}`, power_user?.sysprompt);
+        addIndependentPromptContextParts(parts, `系统提示预设：${systemPromptName || '当前'}`, findPresetByName(system_prompts, systemPromptName));
+    } catch (error) {
+        console.warn(`[${DISPLAY_NAME}] 读取当前酒馆预设线索失败`, error);
+    }
+
+    return trimText(parts.join('\n\n---\n\n'), maxLength, true);
+}
+
+function buildIndependentApiPrompt(prompt, options = {}) {
+    const shouldIncludeTavernContext = options.includeTavernContext !== false;
+    const tavernContext = shouldIncludeTavernContext
+        ? collectIndependentTavernPromptContext({ maxLength: options.contextMax })
+        : '';
+    if (!tavernContext) {
+        return prompt;
+    }
+
+    return [
+        '当前酒馆预设/格式线索（只用于保持角色风格、消息格式、模板顺序和上下文一致；不能当作新增剧情事实）：',
+        tavernContext,
+        '',
+        '本次回复救急任务：',
+        prompt,
+    ].join('\n');
+}
+
+function getActiveApiPreset(settings = getSettings()) {
+    return settings.apiPresets.find(preset => preset.id === settings.activeApiPresetId) || settings.apiPresets[0];
 }
 
 function normalizeApiBaseUrl(baseUrl) {
@@ -4256,44 +4409,6 @@ function normalizeApiBaseUrl(baseUrl) {
     }
 
     return value.replace(/\/(?:chat\/completions|completions|models)$/iu, '');
-}
-
-function buildIndependentApiEndpoint(baseUrl, endpoint) {
-    return `${normalizeApiBaseUrl(baseUrl)}/${endpoint.replace(/^\/+/u, '')}`;
-}
-
-function buildIndependentApiHeaders(preset, includeJson = false) {
-    const headers = {};
-    const auth = getAuthHeaderValue(preset?.apiKey);
-    if (auth) {
-        headers.Authorization = auth;
-    }
-    if (includeJson) {
-        headers['Content-Type'] = 'application/json';
-    }
-
-    return headers;
-}
-
-async function parseApiErrorResponse(response) {
-    const fallback = `${response.status} ${response.statusText}`.trim();
-    let body = '';
-    try {
-        body = await response.text();
-    } catch {
-        return fallback;
-    }
-
-    if (!body) {
-        return fallback;
-    }
-
-    try {
-        const json = JSON.parse(body);
-        return json?.error?.message || json?.message || json?.detail || body.slice(0, 500);
-    } catch {
-        return body.slice(0, 500);
-    }
 }
 
 function extractIndependentModels(data) {
@@ -4308,30 +4423,233 @@ function extractIndependentModels(data) {
     return sanitizeModelList(source);
 }
 
+function buildIndependentBackendPayload(preset) {
+    const payload = {
+        chat_completion_source: 'openai',
+        reverse_proxy: normalizeApiBaseUrl(preset?.baseUrl),
+        proxy_password: String(preset?.apiKey || '').trim(),
+    };
+
+    return payload;
+}
+
+function getIndependentApiCompatibilityProfile(preset = {}) {
+    const source = `${preset?.baseUrl || ''} ${preset?.model || ''}`.toLowerCase();
+    const isGeminiLike = /gemini|google|generativelanguage|aistudio|makersuite/iu.test(source);
+
+    if (isGeminiLike) {
+        return {
+            label: 'Gemini/OpenAI 兼容接口',
+            maxTokensCap: INDEPENDENT_API_GEMINI_MAX_TOKENS,
+            contextMax: INDEPENDENT_API_GEMINI_CONTEXT_MAX,
+        };
+    }
+
+    return {
+        label: 'OpenAI 兼容接口',
+        maxTokensCap: INDEPENDENT_API_SAFE_MAX_TOKENS,
+        contextMax: INDEPENDENT_API_SAFE_CONTEXT_MAX,
+    };
+}
+
+function getIndependentPromptCharLength(prompt) {
+    return String(prompt || '').length;
+}
+
+function getIndependentApiContextMax(prompt, preset) {
+    const promptChars = getIndependentPromptCharLength(prompt);
+    if (promptChars >= INDEPENDENT_API_LARGE_PROMPT_CHAR_THRESHOLD) {
+        return 0;
+    }
+
+    const profile = getIndependentApiCompatibilityProfile(preset);
+    const remainingBeforeLargePrompt = Math.max(0, INDEPENDENT_API_LARGE_PROMPT_CHAR_THRESHOLD - promptChars);
+    if (promptChars >= Math.floor(INDEPENDENT_API_LARGE_PROMPT_CHAR_THRESHOLD * 0.7)) {
+        return Math.min(profile.contextMax, 1000, remainingBeforeLargePrompt);
+    }
+
+    return Math.min(profile.contextMax, remainingBeforeLargePrompt);
+}
+
+function getIndependentApiSafeMaxTokens(prompt, preset, requestedMaxTokens) {
+    const promptChars = getIndependentPromptCharLength(prompt);
+    const profile = getIndependentApiCompatibilityProfile(preset);
+    const cap = promptChars >= INDEPENDENT_API_LARGE_PROMPT_CHAR_THRESHOLD
+        ? Math.min(profile.maxTokensCap, INDEPENDENT_API_LARGE_PROMPT_MAX_TOKENS)
+        : profile.maxTokensCap;
+
+    return Math.max(80, Math.min(requestedMaxTokens, cap));
+}
+
+function buildIndependentApiRequestPlan(prompt, preset, requestedMaxTokens) {
+    const contextMax = getIndependentApiContextMax(prompt, preset);
+    const independentPrompt = buildIndependentApiPrompt(prompt, {
+        includeTavernContext: contextMax > 0,
+        contextMax,
+    });
+    const maxTokens = getIndependentApiSafeMaxTokens(independentPrompt, preset, requestedMaxTokens);
+    const profile = getIndependentApiCompatibilityProfile(preset);
+
+    return {
+        prompt: independentPrompt,
+        maxTokens,
+        contextMax,
+        inputChars: getIndependentPromptCharLength(independentPrompt),
+        profileLabel: profile.label,
+    };
+}
+
+function getIndependentBackendErrorMessage(data, rawText, response) {
+    const errorValue = data?.error;
+    const candidates = [
+        errorValue && typeof errorValue === 'object' ? errorValue.message : '',
+        typeof errorValue === 'string' ? errorValue : '',
+        data?.message,
+        data?.detail,
+        data?.error_description,
+        rawText,
+        `${response.status} ${response.statusText}`.trim(),
+    ];
+
+    return candidates
+        .map(value => String(value || '').trim())
+        .find(Boolean) || '未知错误';
+}
+
+function isGenericIndependentBadRequestMessage(message) {
+    return /^(?:bad request|400 bad request)$/iu.test(String(message || '').trim());
+}
+
+function formatIndependentBackendFailureMessage(response, backendMessage) {
+    const status = Number(response?.status || 0);
+    if ([400, 413, 422].includes(status)) {
+        const detail = isGenericIndependentBadRequestMessage(backendMessage)
+            ? ''
+            : `上游返回：${backendMessage}。`;
+        return `${detail}独立 API 已按保守兼容格式发送，但接口仍拒绝请求。请检查 API URL 是否是 OpenAI 兼容根地址、模型名是否被该接口允许、Key 权限是否足够，以及该模型/中转的上下文和输出上限。`;
+    }
+
+    return backendMessage;
+}
+
+function createIndependentBackendError(failurePrefix, response, data, rawText) {
+    const backendMessage = getIndependentBackendErrorMessage(data, rawText, response);
+    const statusLabel = `${response.status} ${response.statusText}`.trim();
+    const displayMessage = formatIndependentBackendFailureMessage(response, backendMessage);
+    const message = `${failurePrefix}：${displayMessage}`;
+    const error = new Error(message);
+    error.independentApiStatus = response.status;
+    error.independentApiStatusText = response.statusText;
+    error.independentApiBackendMessage = backendMessage;
+    error.independentApiDisplayMessage = displayMessage;
+    error.independentApiRawText = rawText;
+    error.independentApiStatusLabel = statusLabel;
+    return error;
+}
+
+function isRetryableIndependentApiError(error) {
+    const status = Number(error?.independentApiStatus || 0);
+    const message = `${error?.message || ''} ${error?.independentApiBackendMessage || ''}`.toLowerCase();
+
+    if ([400, 413, 422].includes(status)) {
+        return false;
+    }
+
+    return status >= 500
+        || [408, 409, 429].includes(status)
+        || /internal server error|bad gateway|gateway timeout|service unavailable|server error|upstream|context length|max_tokens|max token|token limit|unsupported value|system role|developer role/iu.test(message);
+}
+
+function buildIndependentApiMessages(prompt) {
+    return [
+        {
+            role: 'user',
+            content: `${INDEPENDENT_API_SYSTEM_PROMPT}\n\n${prompt}`,
+        },
+    ];
+}
+
+function buildIndependentGenerateBody(prompt, settings, preset, options = {}) {
+    const maxTokens = clampInteger(
+        options.maxTokens ?? preset.maxTokens,
+        settings.responseLength,
+        80,
+        RESPONSE_LENGTH_MAX,
+    );
+
+    return {
+        ...buildIndependentBackendPayload(preset),
+        model: preset.model,
+        messages: buildIndependentApiMessages(prompt),
+        temperature: clampNumber(preset.temperature, 0.7, 0, 2),
+        max_tokens: maxTokens,
+        stream: false,
+    };
+}
+
+function copyIndependentApiErrorMetadata(target, source) {
+    if (!source) {
+        return target;
+    }
+
+    for (const key of [
+        'independentApiStatus',
+        'independentApiStatusText',
+        'independentApiBackendMessage',
+        'independentApiDisplayMessage',
+        'independentApiRawText',
+        'independentApiStatusLabel',
+    ]) {
+        if (source[key] !== undefined) {
+            target[key] = source[key];
+        }
+    }
+
+    return target;
+}
+
+async function fetchIndependentBackendJson(endpoint, body, failurePrefix) {
+    let response;
+    try {
+        response = await fetch(endpoint, {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            cache: 'no-cache',
+            body: JSON.stringify(body),
+        });
+    } catch (error) {
+        if (error instanceof TypeError) {
+            throw new Error('无法连接 SillyTavern 后端。请确认酒馆仍在运行，然后刷新页面重试。');
+        }
+        throw error;
+    }
+
+    let data = null;
+    let rawText = '';
+    try {
+        rawText = await response.text();
+        data = rawText ? JSON.parse(rawText) : null;
+    } catch {
+        data = null;
+    }
+
+    if (!response.ok || data?.error === true || data?.error?.message || typeof data?.error === 'string') {
+        throw createIndependentBackendError(failurePrefix, response, data, rawText.slice(0, 500));
+    }
+
+    return data;
+}
+
 async function fetchIndependentApiModels(preset) {
     if (!preset?.baseUrl) {
         throw new Error('请先填写独立 API 地址。');
     }
 
-    const url = buildIndependentApiEndpoint(preset.baseUrl, 'models');
-    let response;
-    try {
-        response = await fetch(url, {
-            method: 'GET',
-            headers: buildIndependentApiHeaders(preset),
-        });
-    } catch (error) {
-        if (error instanceof TypeError) {
-            throw new Error('无法连接独立 API。请检查 URL，或确认该接口允许浏览器跨域请求（CORS）。');
-        }
-        throw error;
-    }
-
-    if (!response.ok) {
-        throw new Error(`识别模型失败：${await parseApiErrorResponse(response)}`);
-    }
-
-    const data = await response.json();
+    const data = await fetchIndependentBackendJson(
+        '/api/backends/chat-completions/status',
+        buildIndependentBackendPayload(preset),
+        '识别模型失败',
+    );
     const models = extractIndependentModels(data);
     if (!models.length) {
         throw new Error('接口已响应，但没有识别到可用模型。请确认它兼容 /models 格式。');
@@ -4388,49 +4706,88 @@ async function generateWithIndependentApi(prompt, settings = getSettings()) {
         throw new Error('请先识别并选择一个可用模型。');
     }
 
-    const url = buildIndependentApiEndpoint(preset.baseUrl, 'chat/completions');
-    const body = {
-        model: preset.model,
-        messages: [
-            {
-                role: 'system',
-                content: '你是一个只按要求修复既有回复片段的助手。必须依据用户提供的预设、世界书、正则、上下文和原文证据；不要解释，不要新增无依据事实，不要胡编乱造。',
-            },
-            {
-                role: 'user',
-                content: prompt,
-            },
-        ],
-        temperature: clampNumber(preset.temperature, 0.7, 0, 2),
-        max_tokens: clampInteger(preset.maxTokens, settings.responseLength, 80, RESPONSE_LENGTH_MAX),
-        stream: false,
-    };
+    const requestedMaxTokens = clampInteger(preset.maxTokens, settings.responseLength, 80, RESPONSE_LENGTH_MAX);
+    const requestPlan = buildIndependentApiRequestPlan(prompt, preset, requestedMaxTokens);
+    const body = buildIndependentGenerateBody(requestPlan.prompt, settings, preset, {
+        maxTokens: requestPlan.maxTokens,
+    });
+    const contextLabel = requestPlan.contextMax > 0
+        ? `附加线索约 ${requestPlan.contextMax} 字符`
+        : '已跳过附加预设线索';
+    const data = await fetchIndependentBackendJson(
+        '/api/backends/chat-completions/generate',
+        body,
+        `独立 API 生成失败（${requestPlan.profileLabel}，输入约 ${requestPlan.inputChars} 字符，输出上限 ${requestPlan.maxTokens}，${contextLabel}）`,
+    );
 
-    let response;
-    try {
-        response = await fetch(url, {
-            method: 'POST',
-            headers: buildIndependentApiHeaders(preset, true),
-            body: JSON.stringify(body),
-        });
-    } catch (error) {
-        if (error instanceof TypeError) {
-            throw new Error('无法连接独立 API。请检查 URL，或确认该接口允许浏览器跨域请求（CORS）。');
-        }
-        throw error;
-    }
-
-    if (!response.ok) {
-        throw new Error(`独立 API 生成失败：${await parseApiErrorResponse(response)}`);
-    }
-
-    const data = await response.json();
     const text = extractIndependentApiText(data).trim();
     if (!text) {
         throw new Error('独立 API 返回了空内容，已拒绝预览。');
     }
 
     return text;
+}
+
+function getIndependentApiRetryCount(settings = getSettings()) {
+    return clampInteger(settings.independentApiRetryCount, defaultSettings.independentApiRetryCount, 0, INDEPENDENT_API_MAX_RETRIES);
+}
+
+function isRetryablePreviewGenerationError(error, settings = getSettings()) {
+    if (settings.generationSource !== 'independent') {
+        return false;
+    }
+
+    const status = Number(error?.independentApiStatus || 0);
+    if ([401, 403, 404].includes(status)) {
+        return false;
+    }
+
+    if (status === 429 || isRetryableIndependentApiError(error)) {
+        return true;
+    }
+
+    const message = String(error?.message || '').toLowerCase();
+    if (/请先|没有正在处理|不能安全|原选区|当前回复|没有可用|目标为空|未开启|没有旧|至少需要|请重新扫描/u.test(message)) {
+        return false;
+    }
+
+    return /空内容|标记不完整|没有返回第|开始标记|结束标记|解析|格式|一致|原样|没有变化|internal server error|bad gateway|gateway timeout|service unavailable|upstream/u.test(message);
+}
+
+function getRetryStatusMessage(error, nextAttempt, retryCount) {
+    const message = String(error?.message || error || '生成失败').replace(/\s+/gu, ' ').trim();
+    return `上次生成未通过：${trimText(message, 160)} 正在自动重试 ${nextAttempt}/${retryCount}...`;
+}
+
+async function generatePreviewWithRetries(prompt, statusElement) {
+    const settings = getSettings();
+    const retryCount = settings.generationSource === 'independent' ? getIndependentApiRetryCount(settings) : 0;
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= retryCount; attempt += 1) {
+        if (attempt > 0 && statusElement) {
+            statusElement.textContent = getRetryStatusMessage(lastError, attempt, retryCount);
+        }
+
+        try {
+            const output = await generateRepairOutput(prompt);
+            return {
+                clean: normalizeGeneratedPreviewOutput(output),
+                attempts: attempt + 1,
+                retries: attempt,
+            };
+        } catch (error) {
+            lastError = error;
+            const canRetry = attempt < retryCount && isRetryablePreviewGenerationError(error, settings);
+            if (!canRetry) {
+                throw error;
+            }
+
+            console.warn(`${DISPLAY_NAME}: 本次生成未通过，准备自动重试 ${attempt + 1}/${retryCount}。`, error);
+        }
+    }
+
+    throw lastError || new Error('独立 API 自动重试后仍未生成可用内容。');
 }
 
 async function generateRepairOutput(prompt) {
@@ -4471,30 +4828,20 @@ async function generatePreview() {
         status.textContent = getGenerationStatusText();
         preview.value = '';
 
-        const output = await generateRepairOutput(prompt);
-        let clean = stripWrappingCodeFence(output);
-        if (runtime.active.mode === 'repair_statebar') {
-            clean = normalizeStatusOutput(output);
-        } else if (runtime.active.mode === 'repair_block') {
-            clean = runtime.active.blockEvidence?.applyMode === 'replace_multiple_blocks'
-                ? normalizeMultiBlockOutput(output, runtime.active.blockEvidence)
-                : normalizeBlockOutput(output, runtime.active.blockEvidence);
-        }
-
-        if (!clean.trim()) {
-            throw new Error('模型返回了空内容，已拒绝预览。');
-        }
+        const result = await generatePreviewWithRetries(prompt, status);
+        const clean = result.clean;
+        const retrySuffix = result.retries > 0 ? `（第 ${result.attempts} 次尝试成功）` : '';
 
         preview.value = clean;
         if (runtime.active.blockEvidence?.applyMode === 'replace_multiple_blocks') {
             const missingCount = runtime.active.blockEvidence.targets.filter(target => target.missing).length;
             status.textContent = missingCount
-                ? `已生成 ${runtime.active.blockEvidence.targets.length} 个块的预览，其中 ${missingCount} 个缺失块会按聊天基准顺序插回。`
-                : `已生成 ${runtime.active.blockEvidence.targets.length} 个块的预览。确认无误后会分别替换这些原始块。`;
+                ? `已生成 ${runtime.active.blockEvidence.targets.length} 个块的预览，其中 ${missingCount} 个缺失块会按聊天基准顺序插回。${retrySuffix}`
+                : `已生成 ${runtime.active.blockEvidence.targets.length} 个块的预览。确认无误后会分别替换这些原始块。${retrySuffix}`;
         } else if (runtime.active.blockEvidence?.applyMode === 'insert_missing') {
-            status.textContent = '已生成缺失块预览。确认无误后会按聊天基准顺序插回当前回复。';
+            status.textContent = `已生成缺失块预览。确认无误后会按聊天基准顺序插回当前回复。${retrySuffix}`;
         } else {
-            status.textContent = '已生成预览。确认无误后再应用到当前回复。';
+            status.textContent = `已生成预览。确认无误后再应用到当前回复。${retrySuffix}`;
         }
     } catch (error) {
         const message = error?.message || String(error);
@@ -5554,6 +5901,7 @@ function fillApiPresetForm() {
     setValue('rr-api-key', preset.apiKey);
     setValue('rr-api-max-tokens', preset.maxTokens);
     setValue('rr-api-temperature', preset.temperature);
+    setValue('rr-api-retry-count', settings.independentApiRetryCount);
     fillApiModelControls(preset);
     setApiSettingsVisibility();
 }
@@ -5776,13 +6124,18 @@ function mountSettings() {
                         </label>
                         <label>
                             <span>独立 API 输出长度</span>
-                            <small class="rr-help">最大 ${RESPONSE_LENGTH_MAX}，只影响独立 API。</small>
+                            <small class="rr-help">保存你的期望上限；发送时会按接口兼容性和输入大小自动收敛。</small>
                             <input id="rr-api-max-tokens" class="text_pole" type="number" min="80" max="${RESPONSE_LENGTH_MAX}" step="20">
                         </label>
                         <label>
                             <span>温度</span>
                             <small class="rr-help">越低越稳，建议 0.3 到 0.8。</small>
                             <input id="rr-api-temperature" class="text_pole" type="number" min="0" max="2" step="0.1">
+                        </label>
+                        <label>
+                            <span>自动重试次数</span>
+                            <small class="rr-help">空输出、格式不合格、限流或服务器临时错误时继续尝试；接口拒绝请求不会重复发送。</small>
+                            <input id="rr-api-retry-count" class="text_pole" type="number" min="0" max="${INDEPENDENT_API_MAX_RETRIES}" step="1">
                         </label>
                     </div>
                     <div class="rr-api-toolbar rr-api-actions">
@@ -5835,6 +6188,11 @@ function mountSettings() {
         getSettings().generationSource = event.currentTarget.value === 'independent' ? 'independent' : 'sillytavern';
         saveSettingsDebounced();
         setApiSettingsVisibility();
+    });
+    bind('rr-api-retry-count', 'change', (event) => {
+        getSettings().independentApiRetryCount = clampInteger(event.currentTarget.value, defaultSettings.independentApiRetryCount, 0, INDEPENDENT_API_MAX_RETRIES);
+        event.currentTarget.value = String(getSettings().independentApiRetryCount);
+        saveSettingsDebounced();
     });
     bind('rr-api-preset', 'change', (event) => {
         const nextPresetId = event.currentTarget.value;
