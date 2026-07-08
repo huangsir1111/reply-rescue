@@ -24,7 +24,7 @@ import { textgenerationwebui_preset_names, textgenerationwebui_presets, textgene
 
 const MODULE_NAME = 'reply_rescue';
 const DISPLAY_NAME = '回复救急插件';
-const SETTINGS_VERSION = '0.1.25';
+const SETTINGS_VERSION = '0.1.26';
 const MAX_UNDO_RECORDS = 10;
 const WORLD_INFO_METADATA_KEY = 'world_info';
 const CHAT_BASELINE_METADATA_KEY = 'blockBaseline';
@@ -1537,12 +1537,46 @@ function panelGapLooksSafe(gap) {
         return false;
     }
 
+    if (/^#{1,6}\s+\S/mu.test(value) || /<(?:content|正文|main|body)\b/iu.test(value)) {
+        return false;
+    }
+
+    if (collectCommentBoundaryMarkers(value).length) {
+        return false;
+    }
+
+    const visibleText = value
+        .replace(/<!--[\s\S]*?-->/gu, ' ')
+        .replace(/\/\*[\s\S]*?\*\//gu, ' ')
+        .replace(/\{#[\s\S]*?#\}/gu, ' ')
+        .replace(/<\/?[\w:-]+(?:\s[^<>]*)?>/gu, ' ')
+        .replace(/^[ \t]{0,8}(?:\/\/|#|--|;|%%)\s*[^\r\n]*/gmu, ' ')
+        .replace(/[`~*_=\-+|:：,，;；.。·•#()[\]{}【】「」<>\/\\\s]/gu, '');
+    if (visibleText.trim()) {
+        return false;
+    }
+
     if (/[。！？!?]\s*[\p{L}\p{N}]/u.test(value)) {
         return false;
     }
 
     return /<\/?\s*[a-z][^>]*>/iu.test(value)
         || /^[\s`~*_=\-+|:：,，;；.。·•#()[\]{}【】「」<>\/\\]+$/iu.test(value);
+}
+
+function isCombinablePanelBlock(block) {
+    const source = String(block?.source || '');
+    if (!/HTML|美化|坏块|损坏|组合面板|combined|panel|container|wrapper/iu.test(source)) {
+        return false;
+    }
+
+    const [startMarker = ''] = block?.markerPair || [];
+    const tagName = parseStartTagName(startMarker);
+    if (!tagName || !isHtmlTagName(tagName)) {
+        return false;
+    }
+
+    return /^(?:div|section|article|aside|details|table|ul|ol|pre)$/iu.test(tagName);
 }
 
 function findEnclosingHtmlContainer(source, start, end) {
@@ -1595,8 +1629,7 @@ function combineAdjacentPanelBlocks(blocks, sourceText) {
             return;
         }
 
-        const htmlLikeCount = group.filter(block => /HTML|坏块|美化|面板/u.test(String(block.source || '')) || /^<[^>]+>/.test(block.text)).length;
-        if (htmlLikeCount < 2) {
+        if (group.filter(isCombinablePanelBlock).length < 2) {
             group = [];
             return;
         }
@@ -1622,6 +1655,12 @@ function combineAdjacentPanelBlocks(blocks, sourceText) {
     };
 
     for (const block of sorted) {
+        if (!isCombinablePanelBlock(block)) {
+            flush();
+            group = [];
+            continue;
+        }
+
         if (!group.length) {
             group = [block];
             continue;
@@ -1632,6 +1671,8 @@ function combineAdjacentPanelBlocks(blocks, sourceText) {
         const canJoin = block.start >= previous.end
             && block.start - previous.end <= 800
             && block.end - group[0].start <= BLOCK_DETECTION_MAX
+            && isCombinablePanelBlock(previous)
+            && isCombinablePanelBlock(block)
             && panelGapLooksSafe(gap);
 
         if (canJoin) {
