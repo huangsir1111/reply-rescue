@@ -24,6 +24,8 @@ https://github.com/huangsir1111/reply-rescue
 - 当前预设线索：独立 API 会按输入大小附带少量当前酒馆格式/风格线索，输入较大时会自动跳过额外线索，优先保证原文和修复要求。
 - 保守兼容请求：独立 API 会在发送前整理为单条 user 消息，并自动收敛实际输出上限，减少 `system` 角色、超大 `max_tokens` 或上下文预算导致的请求拒绝。
 - 自动重试：独立 API 空输出、格式不合格、限流或服务器临时错误时，可按设置继续重试，最高 100 次；请求被接口拒绝时不会重复发送同一个错误请求。
+- 通用注释边界：支持 HTML 注释、行注释、块注释里的 `begin/start/region` 到 `end/stop/endregion` 成对块。
+- 真取消：生成预览过程中点“取消”会中止当前请求，不再只是关掉 UI。
 - 移动端适配：手机端单列布局，块列表、扫描按钮和底部按钮都能自适应换行。
 
 ## 修改结构块
@@ -41,6 +43,7 @@ https://github.com/huangsir1111/reply-rescue
 
 - XML/类 XML 成对标签，例如 `<StatusBlock>...</StatusBlock>`、`<InventoryPanel>...</InventoryPanel>`。
 - 方括号/中文括号成对块，例如 `[状态栏]...[/状态栏]`、`【选项栏】...【/选项栏】`。
+- 通用注释边界，例如 `<!-- begin_of_Subtext_think -->...<!-- end_of_Subtext_think -->`、`#region 状态栏...#endregion 状态栏`、`// begin 面板...// end 面板`。
 - 带 `class`、`id`、`style`、`data-*`、`aria-*` 的 HTML 美化容器，例如 `<div class="status-panel">...</div>`。
 - 当前预设、正则和相关世界书里的格式线索，但它们只作为格式证据。
 

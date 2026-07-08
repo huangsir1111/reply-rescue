@@ -24,7 +24,7 @@ import { textgenerationwebui_preset_names, textgenerationwebui_presets, textgene
 
 const MODULE_NAME = 'reply_rescue';
 const DISPLAY_NAME = '回复救急插件';
-const SETTINGS_VERSION = '0.1.24';
+const SETTINGS_VERSION = '0.1.25';
 const MAX_UNDO_RECORDS = 10;
 const WORLD_INFO_METADATA_KEY = 'world_info';
 const CHAT_BASELINE_METADATA_KEY = 'blockBaseline';
@@ -122,7 +122,69 @@ const runtime = {
     selectedBlockIndex: -1,
     selectedBlockIndexes: new Set(),
     selectionSnapshot: null,
+    activeGeneration: null,
+    generationToken: 0,
 };
+
+function makeGenerationCancelledError() {
+    const error = new Error('已取消生成。');
+    error.name = 'AbortError';
+    return error;
+}
+
+function isGenerationCancelledError(error) {
+    const message = String(error?.message || error || '').toLowerCase();
+    return error?.name === 'AbortError'
+        || /abort|aborted|cancelled|canceled|已取消|取消生成|cancelled by stop event/u.test(message);
+}
+
+function startPreviewGenerationTask(settings = getSettings()) {
+    if (runtime.activeGeneration) {
+        cancelActiveGeneration();
+    }
+
+    runtime.generationToken += 1;
+    const task = {
+        token: runtime.generationToken,
+        source: settings.generationSource,
+        controller: new AbortController(),
+        cancelled: false,
+    };
+    runtime.activeGeneration = task;
+    return task;
+}
+
+function cancelActiveGeneration() {
+    const task = runtime.activeGeneration;
+    if (!task) {
+        return false;
+    }
+
+    task.cancelled = true;
+    if (!task.controller.signal.aborted) {
+        task.controller.abort(makeGenerationCancelledError());
+    }
+
+    if (task.source !== 'independent') {
+        eventSource.emit(event_types.GENERATION_STOPPED);
+    }
+
+    runtime.generationToken += 1;
+    runtime.activeGeneration = null;
+    return true;
+}
+
+function finishPreviewGenerationTask(task) {
+    if (runtime.activeGeneration?.token === task?.token) {
+        runtime.activeGeneration = null;
+    }
+}
+
+function throwIfPreviewGenerationCancelled(task) {
+    if (!task || task.cancelled || task.controller.signal.aborted || runtime.activeGeneration?.token !== task.token) {
+        throw makeGenerationCancelledError();
+    }
+}
 
 function cloneDefaultValue(value) {
     if (Array.isArray(value)) {
@@ -1134,6 +1196,191 @@ function findMarkdownCodeFenceBlocks(text) {
     return blocks;
 }
 
+const COMMENT_BOUNDARY_MARKER_MAX = 220;
+const commentBoundaryKeywordPattern = '(begin|start|open|region|end|stop|close|finish|endregion|开始|起始|开头|打开|区域|结束|结尾|停止|终止|关闭|区域结束)';
+
+function cleanCommentBoundaryName(name) {
+    return String(name || '')
+        .replace(/^[\s"'`([{【「『]+|[\s"'`\])}】」』.,;:：，。；]+$/gu, '')
+        .replace(/\s+/gu, ' ')
+        .trim()
+        .slice(0, 80)
+        .trim();
+}
+
+function getCommentBoundaryRole(keyword) {
+    const value = String(keyword || '').trim().toLowerCase();
+    return /^(?:end|stop|close|finish|endregion|结束|结尾|停止|终止|关闭|区域结束)$/iu.test(value)
+        ? 'end'
+        : 'start';
+}
+
+function parseCommentBoundaryInner(inner) {
+    const source = String(inner || '')
+        .replace(/^[\s#@!*=-]+/u, '')
+        .replace(/\s+/gu, ' ')
+        .trim();
+    if (!source || source.length > COMMENT_BOUNDARY_MARKER_MAX) {
+        return null;
+    }
+
+    const prefixRegex = new RegExp(`^${commentBoundaryKeywordPattern}(?:[_-]?of)?(?:[_\\-\\s:：=]+)(.{1,120})$`, 'iu');
+    const suffixRegex = new RegExp(`^(.{1,120}?)(?:[_\\-\\s:：=]+)${commentBoundaryKeywordPattern}$`, 'iu');
+    const match = source.match(prefixRegex);
+    const suffixMatch = match ? null : source.match(suffixRegex);
+    const keyword = match?.[1] || suffixMatch?.[2] || '';
+    const rawName = match?.[2] || suffixMatch?.[1] || '';
+    const name = cleanCommentBoundaryName(rawName);
+
+    if (!name || !isSafeMarkerName(name)) {
+        return null;
+    }
+
+    return {
+        role: getCommentBoundaryRole(keyword),
+        name,
+        key: name.toLowerCase(),
+    };
+}
+
+function getCommentBoundaryInnerFromMarker(marker) {
+    const source = String(marker || '').trim();
+    let match = source.match(/^<!--([\s\S]*?)-->$/u);
+    if (match) {
+        return match[1];
+    }
+
+    match = source.match(/^\/\*([\s\S]*?)\*\/$/u);
+    if (match) {
+        return match[1];
+    }
+
+    match = source.match(/^\{#([\s\S]*?)#\}$/u);
+    if (match) {
+        return match[1];
+    }
+
+    match = source.match(/^(?:\/\/|#|--|;|%%)\s*([^\r\n]{1,220})$/u);
+    return match?.[1] || '';
+}
+
+function pushCommentBoundaryMarker(markers, start, end, markerText, inner, syntax) {
+    const parsed = parseCommentBoundaryInner(inner);
+    if (!parsed) {
+        return;
+    }
+
+    markers.push({
+        start,
+        end,
+        markerText,
+        syntax,
+        ...parsed,
+    });
+}
+
+function collectCommentBoundaryMarkers(text) {
+    const source = String(text || '');
+    const markers = [];
+    const seen = new Set();
+    const blockPatterns = [
+        { regex: /<!--([\s\S]*?)-->/gu, syntax: 'HTML注释边界' },
+        { regex: /\/\*([\s\S]*?)\*\//gu, syntax: '块注释边界' },
+        { regex: /\{#([\s\S]*?)#\}/gu, syntax: '模板注释边界' },
+    ];
+
+    for (const pattern of blockPatterns) {
+        let match;
+        while ((match = pattern.regex.exec(source))) {
+            const markerText = match[0];
+            const inner = match[1] || '';
+            if (markerText.length > COMMENT_BOUNDARY_MARKER_MAX + 40 || /[\r\n]/u.test(inner)) {
+                continue;
+            }
+
+            const key = `${match.index}:${match.index + markerText.length}`;
+            if (seen.has(key)) {
+                continue;
+            }
+
+            seen.add(key);
+            pushCommentBoundaryMarker(markers, match.index, match.index + markerText.length, markerText, inner, pattern.syntax);
+        }
+    }
+
+    const lineRegex = /(^|\n)([ \t]{0,8})(\/\/|#|--|;|%%)\s*([^\r\n]{1,220})/gu;
+    let lineMatch;
+    while ((lineMatch = lineRegex.exec(source))) {
+        const start = lineMatch.index + lineMatch[1].length;
+        const markerText = lineMatch[0].slice(lineMatch[1].length).trimEnd();
+        const end = start + markerText.length;
+        const key = `${start}:${end}`;
+        if (seen.has(key)) {
+            continue;
+        }
+
+        seen.add(key);
+        pushCommentBoundaryMarker(markers, start, end, markerText, lineMatch[4] || '', '行注释边界');
+    }
+
+    return markers.sort((a, b) => a.start - b.start || a.end - b.end);
+}
+
+function getCommentBoundaryLabel(name) {
+    const source = String(name || '');
+    if (/think|thinking|reason|reasoning|analysis|subtext|思考|推理|内心/iu.test(source)) {
+        return `${source} 推理块`;
+    }
+    if (/status|state|状态|状态栏/iu.test(source)) {
+        return `${source} 状态块`;
+    }
+    if (/option|choice|select|button|选项|选择|按钮/iu.test(source)) {
+        return `${source} 选项块`;
+    }
+
+    return `${source} 注释块`;
+}
+
+function findCommentBoundaryBlocks(text) {
+    const source = String(text || '');
+    const markers = collectCommentBoundaryMarkers(source);
+    const blocks = [];
+    let consumedUntil = -1;
+
+    for (let i = 0; i < markers.length; i += 1) {
+        const startMarker = markers[i];
+        if (startMarker.role !== 'start' || startMarker.start < consumedUntil) {
+            continue;
+        }
+
+        const endMarkerIndex = markers.findIndex((marker, index) => index > i && marker.role === 'end' && marker.key === startMarker.key);
+        if (endMarkerIndex === -1) {
+            continue;
+        }
+
+        const endMarker = markers[endMarkerIndex];
+        const blockText = source.slice(startMarker.start, endMarker.end);
+        const bodyText = source.slice(startMarker.end, endMarker.start);
+        if (!bodyText.trim() || blockText.length > BLOCK_DETECTION_MAX) {
+            continue;
+        }
+
+        blocks.push({
+            start: startMarker.start,
+            end: endMarker.end,
+            text: blockText,
+            markerPair: [startMarker.markerText, endMarker.markerText],
+            markerName: getCommentBoundaryLabel(startMarker.name),
+            source: startMarker.syntax || '注释边界',
+        });
+
+        consumedUntil = endMarker.end;
+        i = endMarkerIndex;
+    }
+
+    return blocks;
+}
+
 function findMatchingHtmlEnd(source, startIndex, tagName) {
     const tagPattern = new RegExp(`<\\s*/?\\s*${escapeRegExp(tagName)}\\b[^>]*>`, 'giu');
     tagPattern.lastIndex = startIndex;
@@ -1438,6 +1685,7 @@ function collectActualRecognizedBlocks(text, settings = getSettings(), templateT
     const blocks = [
         ...parsed.blocks.map(block => ({ ...block, source: '结构标记' })),
         ...findBracketStructureBlocks(source),
+        ...findCommentBoundaryBlocks(source),
         ...findMarkdownCodeFenceBlocks(source),
         ...findHtmlIslandBlocks(source),
         ...findBrokenHtmlIslandBlocks(source),
@@ -1535,8 +1783,9 @@ function getMarkerNamesForMatch(marker) {
     const corner = source.match(/^\u3010\/?([^\u3011\r\n]{1,80})\u3011$/u)?.[1] || '';
     const quote = source.match(/^\u300C\/?([^\u300D\r\n]{1,80})\u300D$/u)?.[1] || '';
     const fenceInfo = source.match(/^[`~]{3,}\s*([^\s`~]{1,80})/u)?.[1] || '';
+    const commentBoundary = parseCommentBoundaryInner(getCommentBoundaryInnerFromMarker(source))?.name || '';
 
-    return [htmlStart, htmlEnd, square, corner, quote, fenceInfo].filter(Boolean);
+    return [htmlStart, htmlEnd, square, corner, quote, fenceInfo, commentBoundary].filter(Boolean);
 }
 
 function addBlockMarkerTokens(tokens, marker) {
@@ -1556,6 +1805,7 @@ function addOuterTextMarkerTokens(tokens, text) {
     addBlockMarkerTokens(tokens, source.match(/^\u3010[^\u3011\r\n]{1,80}\u3011/u)?.[0] || '');
     addBlockMarkerTokens(tokens, source.match(/^\u300C[^\u300D\r\n]{1,80}\u300D/u)?.[0] || '');
     addBlockMarkerTokens(tokens, source.match(/^[`~]{3,}[^\r\n]*/u)?.[0] || '');
+    addBlockMarkerTokens(tokens, source.match(/^(?:<!--[\s\S]{0,260}?-->|\/\*[\s\S]{0,260}?\*\/|\{#[\s\S]{0,260}?#\}|[ \t]{0,8}(?:\/\/|#|--|;|%%)\s*[^\r\n]{1,220})/u)?.[0] || '');
 }
 
 function getBlockMatchTokens(block) {
@@ -1596,6 +1846,10 @@ function getBlockContentMarkerTokens(block) {
         if (isSafeMarkerName(name) && !name.startsWith('/')) {
             addBlockMatchToken(tokens, name);
         }
+    }
+
+    for (const marker of collectCommentBoundaryMarkers(source)) {
+        addBlockMatchToken(tokens, marker.name);
     }
 
     return tokens;
@@ -4608,7 +4862,7 @@ function copyIndependentApiErrorMetadata(target, source) {
     return target;
 }
 
-async function fetchIndependentBackendJson(endpoint, body, failurePrefix) {
+async function fetchIndependentBackendJson(endpoint, body, failurePrefix, signal = null) {
     let response;
     try {
         response = await fetch(endpoint, {
@@ -4616,8 +4870,12 @@ async function fetchIndependentBackendJson(endpoint, body, failurePrefix) {
             headers: getRequestHeaders(),
             cache: 'no-cache',
             body: JSON.stringify(body),
+            ...(signal ? { signal } : {}),
         });
     } catch (error) {
+        if (signal?.aborted || isGenerationCancelledError(error)) {
+            throw makeGenerationCancelledError();
+        }
         if (error instanceof TypeError) {
             throw new Error('无法连接 SillyTavern 后端。请确认酒馆仍在运行，然后刷新页面重试。');
         }
@@ -4697,7 +4955,7 @@ function extractIndependentApiText(data) {
     return '';
 }
 
-async function generateWithIndependentApi(prompt, settings = getSettings()) {
+async function generateWithIndependentApi(prompt, settings = getSettings(), signal = null) {
     const preset = getActiveApiPreset(settings);
     if (!preset?.baseUrl) {
         throw new Error('请先在回复救急插件设置里填写独立 API 地址。');
@@ -4718,6 +4976,7 @@ async function generateWithIndependentApi(prompt, settings = getSettings()) {
         '/api/backends/chat-completions/generate',
         body,
         `独立 API 生成失败（${requestPlan.profileLabel}，输入约 ${requestPlan.inputChars} 字符，输出上限 ${requestPlan.maxTokens}，${contextLabel}）`,
+        signal,
     );
 
     const text = extractIndependentApiText(data).trim();
@@ -4759,24 +5018,31 @@ function getRetryStatusMessage(error, nextAttempt, retryCount) {
     return `上次生成未通过：${trimText(message, 160)} 正在自动重试 ${nextAttempt}/${retryCount}...`;
 }
 
-async function generatePreviewWithRetries(prompt, statusElement) {
+async function generatePreviewWithRetries(prompt, statusElement, task) {
     const settings = getSettings();
     const retryCount = settings.generationSource === 'independent' ? getIndependentApiRetryCount(settings) : 0;
     let lastError = null;
 
     for (let attempt = 0; attempt <= retryCount; attempt += 1) {
+        throwIfPreviewGenerationCancelled(task);
+
         if (attempt > 0 && statusElement) {
             statusElement.textContent = getRetryStatusMessage(lastError, attempt, retryCount);
         }
 
         try {
-            const output = await generateRepairOutput(prompt);
+            const output = await generateRepairOutput(prompt, task);
+            throwIfPreviewGenerationCancelled(task);
             return {
                 clean: normalizeGeneratedPreviewOutput(output),
                 attempts: attempt + 1,
                 retries: attempt,
             };
         } catch (error) {
+            if (isGenerationCancelledError(error)) {
+                throw makeGenerationCancelledError();
+            }
+
             lastError = error;
             const canRetry = attempt < retryCount && isRetryablePreviewGenerationError(error, settings);
             if (!canRetry) {
@@ -4790,10 +5056,11 @@ async function generatePreviewWithRetries(prompt, statusElement) {
     throw lastError || new Error('独立 API 自动重试后仍未生成可用内容。');
 }
 
-async function generateRepairOutput(prompt) {
+async function generateRepairOutput(prompt, task) {
     const settings = getSettings();
+    throwIfPreviewGenerationCancelled(task);
     if (settings.generationSource === 'independent') {
-        return generateWithIndependentApi(prompt, settings);
+        return generateWithIndependentApi(prompt, settings, task?.controller?.signal || null);
     }
 
     return generateRaw({
@@ -4817,6 +5084,7 @@ async function generatePreview() {
     const button = document.getElementById('rr-generate');
     const preview = document.getElementById('rr-preview');
     const status = document.getElementById('rr-modal-status');
+    let task = null;
 
     try {
         if (!runtime.active) {
@@ -4824,11 +5092,14 @@ async function generatePreview() {
         }
 
         const prompt = buildPromptForActive();
+        const settings = getSettings();
+        task = startPreviewGenerationTask(settings);
         button.disabled = true;
         status.textContent = getGenerationStatusText();
         preview.value = '';
 
-        const result = await generatePreviewWithRetries(prompt, status);
+        const result = await generatePreviewWithRetries(prompt, status, task);
+        throwIfPreviewGenerationCancelled(task);
         const clean = result.clean;
         const retrySuffix = result.retries > 0 ? `（第 ${result.attempts} 次尝试成功）` : '';
 
@@ -4844,11 +5115,21 @@ async function generatePreview() {
             status.textContent = `已生成预览。确认无误后再应用到当前回复。${retrySuffix}`;
         }
     } catch (error) {
+        if (isGenerationCancelledError(error)) {
+            if (status) {
+                status.textContent = '已取消生成。';
+            }
+            return;
+        }
+
         const message = error?.message || String(error);
         status.textContent = message;
         notify('error', message);
     } finally {
-        button.disabled = false;
+        finishPreviewGenerationTask(task);
+        if (button) {
+            button.disabled = false;
+        }
     }
 }
 
@@ -5502,12 +5783,25 @@ function openBlockRescueUi({ keepInstruction = false } = {}) {
 }
 
 function closeRescueModal() {
+    cancelActiveGeneration();
     document.getElementById('rr-modal-overlay').hidden = true;
     document.getElementById('rr-modal').hidden = true;
     runtime.active = null;
     runtime.recognizedBlocks = [];
     resetRecognizedBlockSelection();
     updateDeleteSelectedBlocksButton();
+}
+
+function cancelOrCloseRescueModal() {
+    if (cancelActiveGeneration()) {
+        const status = document.getElementById('rr-modal-status');
+        if (status) {
+            status.textContent = '已取消生成。';
+        }
+        return;
+    }
+
+    closeRescueModal();
 }
 
 function resetModalForChatChange() {
@@ -5806,7 +6100,7 @@ function mountModal() {
 
     document.body.append(overlay, modal);
     document.getElementById('rr-close').addEventListener('click', closeRescueModal);
-    document.getElementById('rr-cancel').addEventListener('click', closeRescueModal);
+    document.getElementById('rr-cancel').addEventListener('click', cancelOrCloseRescueModal);
     overlay.addEventListener('click', closeRescueModal);
     document.getElementById('rr-rescan-blocks')?.addEventListener('click', () => {
         openBlockRescueUi({ keepInstruction: true });
